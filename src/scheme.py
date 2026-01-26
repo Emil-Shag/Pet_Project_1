@@ -1,17 +1,22 @@
-from src.element import Element
+from src.element import BranchingMixin, Element
 from src.joint import Joint
-from src.validation import SchemeValidationError
+
+
+class SchemeValidationError(Exception):
+    pass
+
 
 class Scheme:
     """Сборка элементов в схему"""
 
     def __init__(self):
-        self.joints = []
-        self.elements = []
+        self.joints: list[Joint] = []
+        self.elements: list[Element] = []
 
-    def create_joint(self) -> Joint:
+    def create_joint(self, diagnostic: bool = True) -> Joint:
         """Создание стыка"""
         joint = Joint()
+        joint.diagnostic = diagnostic
         self.joints.append(joint)
         return joint
 
@@ -19,40 +24,113 @@ class Scheme:
         """Добавление элемента"""
         self.elements.append(element)
 
+    # -----------------------
+    # НУМЕРАЦИЯ СТЫКОВ
+    # -----------------------
+    def number_joints(self, start_joint: Joint):
+        if not getattr(start_joint, "diagnostic", True):
+            raise ValueError("Стартовый стык не входит в диагностику")
+
+        number = 1
+        start_joint.number = number
+        visited = {start_joint}
+        branches: list[tuple[Joint, Joint]] = []
+
+        current = start_joint
+        came_from = None
+
+        # 1️⃣ Нумерация основного ствола
+        while True:
+            neighbors = Scheme._get_neighbors(current, came_from)
+
+            if not neighbors:
+                break
+
+            if len(neighbors) > 1:
+                main_pair, branch_pair = Scheme._resolve_branch(current, came_from, neighbors)
+                if branch_pair is not None:
+                    branches.append(branch_pair)
+                next_joint, _ = main_pair
+            else:
+                next_joint, _ = neighbors[0]
+
+            if next_joint in visited:
+                break
+
+            number += 1
+            next_joint.number = number
+            visited.add(next_joint)
+
+            came_from = current
+            current = next_joint
+
+        # 2️⃣ Нумерация ветвей
+        for branch_joint, from_joint in branches:
+            number = self._number_branch(branch_joint, from_joint, number, visited)
+
+        # 3️⃣ Островки
+        for joint in self.joints:
+            if not getattr(joint, "diagnostic", True) or joint in visited:
+                continue
+
+            number += 1
+            joint.number = number
+            visited.add(joint)
+
+            number = self._number_branch(joint, None, number, visited)
+
+    # -----------------------
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # -----------------------
+    def _number_branch(self, start: Joint, came_from: Joint, number: int, visited: set) -> int:
+        stack = [(start, came_from)]
+
+        while stack:
+            joint, prev = stack.pop()
+            if joint in visited:
+                continue
+
+            number += 1
+            joint.number = number
+            visited.add(joint)
+
+            for next_joint, _ in Scheme._get_neighbors(joint, prev):
+                stack.append((next_joint, joint))
+
+        return number
+
     @staticmethod
-    def _get_neighbors(joint: Joint) -> list[Joint]:
-        """Добавление соседнего стыка"""
+    def _get_neighbors(joint: Joint, came_from: Joint = None) -> list[tuple[Joint, Element]]:
+        """Возвращает соседние стыки для обхода"""
         neighbors = []
         for element in joint.elements:
             for j in element.joints:
-                if j is not joint:
-                    neighbors.append(j)
+                if j is not joint and (came_from is None or j != came_from) and getattr(j, "diagnostic", True):
+                    neighbors.append((j, element))
         return neighbors
 
-    def number_joints(self, start_joint: Joint):
-        """Добавление нумерации стыков"""
-        current_number = 1
+    @staticmethod
+    def _resolve_branch(current: Joint, came_from: Joint, options: list[tuple[Joint, Element]]):
+        """
+        Универсальный метод для ветвящихся элементов.
+        Возвращает кортежи:
+            - main_pair: tuple[Joint, Element]
+            - branch_pair: tuple[Joint, Joint] | None
+        """
+        for joint, element in options:
+            if isinstance(element, BranchingMixin):
+                main, branch = element.resolve(current)
 
-        if not start_joint.diagnostic:
-            raise ValueError("Стартовый стык не входит в диагностику")
+                # fallback на текущий стык, если resolve вернул None
+                if main is None:
+                    main = joint
 
-        start_joint.number = current_number
-        visited = {start_joint}
+                main_pair = (main, element)
+                branch_pair = (branch, current) if branch is not None else None
+                return main_pair, branch_pair
 
-        def dfs(joint: Joint):
-            nonlocal current_number
-
-            for neighbor in self._get_neighbors(joint):
-                if neighbor in visited:
-                    continue
-                if not neighbor.diagnostic:
-                    continue
-                current_number += 1
-                neighbor.number = current_number
-                visited.add(neighbor)
-                dfs(neighbor)
-
-        dfs(start_joint)
+        # fallback: первый элемент в списке
+        return options[0], None
 
     def get_joint_by_number(self, number: int) -> Joint | None:
         for joint in self.joints:
@@ -60,45 +138,30 @@ class Scheme:
                 return joint
         return None
 
+    # -----------------------
+    # ВАЛИДАЦИЯ
+    # -----------------------
     def validate(self):
-        self._validate_joints_not_empty()
-        self._validate_terminal_joints()
-        self._validate_no_open_welds()
-
-    def _validate_joints_not_empty(self):
-        if not self.elements:
-            raise SchemeValidationError("Схема не содержит элементов")
-
-    def _validate_terminal_joints(self):
-        for element in self.elements:
-            if element.role != "terminal":
+        """Проверка валидности схемы"""
+        for joint in self.joints:
+            if not joint.elements:
                 continue
 
-            joint = element.joints[0]
+            # собираем концевые и проходные элементы на стыке
+            terminal_elements = [
+                e
+                for e in joint.elements
+                if e.element_type in ("Заглушка", "Свечная труба", "Разрыв трубы", "Фланец", "ТПА")
+            ]
+            passing_elements = [
+                e
+                for e in joint.elements
+                if e.element_type not in ("Заглушка", "Свечная труба", "Разрыв трубы", "Фланец", "ТПА")
+            ]
 
-            connected = joint.elements
-
-            if len(connected) > 2:
-                raise SchemeValidationError(
-                    f"Стык {joint.temp_id}: к концевому элементу подключено более одного элемента"
-                )
-
-            for e in connected:
-                if e is not element and e.role == "terminal":
-                    raise SchemeValidationError(
-                        f"Стык {joint.temp_id}: два концевых элемента на одном стыке"
-                    )
-
-    def _validate_no_open_welds(self):
-        for joint in self.joints:
-            if len(joint.elements) == 1:
-                element = joint.elements[0]
-
-                if element.role != "terminal":
-                    raise SchemeValidationError(
-                        f"Открытый сварной шов: стык {joint.temp_id}"
-                    )
-
-    def apply_diagnostic_boundaries(self):
-        for element in self.elements:
-            element.apply_diagnostic_boundary()
+            if terminal_elements and passing_elements:
+                # Разрешаем для стартового стыка
+                if joint == self.joints[0]:
+                    continue  # пропускаем проверку для стартового стыка
+                # иначе для обычного стыка — ошибка
+                raise ValueError(f"Стык {joint.number}: концевой элемент не может сочетаться с проходным")
