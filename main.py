@@ -42,6 +42,10 @@ if __name__ == "__main__":
         # ВРЕЗКА
         # =======================
         if choice == "7":
+            if not new_scheme.elements:
+                print("Нет элементов, к которым можно присоединить врезку")
+                continue
+
             print("\nВыберите элемент, в который врезка будет вставлена:")
             for idx, elem in enumerate(new_scheme.elements, 1):
                 print(f"{idx}: {elem}")
@@ -49,7 +53,7 @@ if __name__ == "__main__":
             try:
                 elem_idx = int(input("> ")) - 1
                 base_element = new_scheme.elements[elem_idx]
-            except ValueError, IndexError:
+            except (ValueError, IndexError):
                 print("Неверный выбор элемента")
                 continue
 
@@ -102,7 +106,6 @@ if __name__ == "__main__":
 
             # КОНЦЕВЫЕ ЭЛЕМЕНТЫ
             elif choice in ("8", "9", "10"):
-                # Разрешаем добавлять концевой элемент к любому стыку
                 if choice == "8":
                     element = Plug(base_joint)
                     print("Добавлена Заглушка")
@@ -133,13 +136,9 @@ if __name__ == "__main__":
         print(f"Ошибка нумерации: {e}")
 
     # =======================
-    # ВАЛИДАЦИЯ СХЕМЫ
+    # ВАЛИДАЦИЯ КОНЦЕВЫХ ЭЛЕМЕНТОВ
     # =======================
-    try:
-        new_scheme.validate()
-        print("\nСхема прошла проверку валидности")
-    except Exception as e:
-        print(f"\nОшибка валидации схемы: {e}")
+    new_scheme.validate_terminal_elements()
 
     # =======================
     # ОТЧЁТ

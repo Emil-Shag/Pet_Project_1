@@ -1,5 +1,4 @@
 from abc import ABC
-
 from src.joint import Joint
 
 
@@ -14,9 +13,24 @@ class Element(ABC):
             joint.elements.append(self)
 
     def element_number(self) -> str:
-        """Возвращает номер элемента в виде '1-2' или '3-4-5'"""
-        numbers = [str(j.number if j.number is not None else 0) for j in self.joints]
-        return "-".join(numbers)
+        """
+        Возвращает номер элемента в виде '1-2' или '3-4-5'.
+        Для концевых элементов с terminal=True один стык заменяется на 0.
+        """
+        numbers = []
+        for idx, j in enumerate(self.joints):
+            n = j.number if j.number is not None else 0
+            numbers.append(n)
+
+        # концевой элемент с двумя стыками
+        if getattr(self, "terminal", False) and len(numbers) == 2:
+            # стартовый элемент
+            if numbers[0] == 1:
+                numbers[0] = 0
+            else:
+                numbers[1] = 0
+
+        return "-".join(str(n) for n in numbers)
 
     def __repr__(self):
         return f"{self.element_type}({self.element_number()})"
@@ -47,22 +61,16 @@ class BranchingMixin:
 # ПРОХОДНЫЕ ЭЛЕМЕНТЫ
 # ===============================
 class Pipe(Element):
-    """Катушка"""
-
     def __init__(self, joint1: Joint, joint2: Joint):
         super().__init__("Катушка", [joint1, joint2])
 
 
 class Elbow(Element):
-    """Отвод"""
-
     def __init__(self, joint1: Joint, joint2: Joint):
         super().__init__("Отвод", [joint1, joint2])
 
 
 class Tee(BranchingMixin, Element):
-    """Тройник"""
-
     def __init__(self, joint_main_1: Joint, joint_branch: Joint, joint_main_2: Joint):
         super().__init__("Тройник", [joint_main_1, joint_branch, joint_main_2])
         self.main_joints = (joint_main_1, joint_main_2)
@@ -70,29 +78,22 @@ class Tee(BranchingMixin, Element):
 
 
 class Adapter(Element):
-    """Переход"""
-
     def __init__(self, joint1: Joint, joint2: Joint):
         super().__init__("Переход", [joint1, joint2])
 
 
 class Fittings(Element):
-    """ТПА"""
-
     def __init__(self, joint1: Joint, joint2: Joint):
         super().__init__("ТПА", [joint1, joint2])
 
 
 class Flange(Element):
-    """Фланец"""
-
     def __init__(self, joint1: Joint, joint2: Joint):
         super().__init__("Фланец", [joint1, joint2])
 
 
 class Insert(Element, BranchingMixin):
     """Врезка — обычная катушка с двумя концами"""
-
     def __init__(self, joint_main: Joint, joint_branch: Joint):
         super().__init__("Врезка", [joint_main, joint_branch])
 
@@ -101,21 +102,15 @@ class Insert(Element, BranchingMixin):
 # КОНЦЕВЫЕ ЭЛЕМЕНТЫ
 # ===============================
 class Plug(Element):
-    """Заглушка"""
-
     def __init__(self, joint1: Joint):
         super().__init__("Заглушка", [joint1])
 
 
 class CandlePipe(Element):
-    """Свечная труба"""
-
     def __init__(self, joint1: Joint):
         super().__init__("Свечная труба", [joint1])
 
 
 class PipeBreak(Element):
-    """Разрыв трубы"""
-
     def __init__(self, joint1: Joint):
         super().__init__("Разрыв трубы", [joint1])
