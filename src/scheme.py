@@ -1,6 +1,6 @@
 from src.element import Element
 from src.joint import Joint
-
+from src.validation import SchemeValidationError
 
 class Scheme:
     """Сборка элементов в схему"""
@@ -54,3 +54,42 @@ class Scheme:
             if joint.number == number:
                 return joint
         return None
+
+    def validate(self):
+        self._validate_joints_not_empty()
+        self._validate_terminal_joints()
+        self._validate_no_open_welds()
+
+    def _validate_joints_not_empty(self):
+        if not self.elements:
+            raise SchemeValidationError("Схема не содержит элементов")
+
+    def _validate_terminal_joints(self):
+        for element in self.elements:
+            if element.role != "terminal":
+                continue
+
+            joint = element.joints[0]
+
+            connected = joint.elements
+
+            if len(connected) > 2:
+                raise SchemeValidationError(
+                    f"Стык {joint.temp_id}: к концевому элементу подключено более одного элемента"
+                )
+
+            for e in connected:
+                if e is not element and e.role == "terminal":
+                    raise SchemeValidationError(
+                        f"Стык {joint.temp_id}: два концевых элемента на одном стыке"
+                    )
+
+    def _validate_no_open_welds(self):
+        for joint in self.joints:
+            if len(joint.elements) == 1:
+                element = joint.elements[0]
+
+                if element.role != "terminal":
+                    raise SchemeValidationError(
+                        f"Открытый сварной шов: стык {joint.temp_id}"
+                    )

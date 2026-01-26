@@ -3,7 +3,7 @@ class Joint:
 
     _counter = 1
 
-    def __init__(self):
+    def __init__(self, diagnostic: bool = True):
         self.temp_id = Joint._counter
         Joint._counter += 1
         self.number = None
