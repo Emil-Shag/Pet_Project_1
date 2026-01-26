@@ -8,7 +8,14 @@ class ReportTable:
         """Возвращает строки таблицы отчёта"""
         rows = []
         for element in self.scheme.elements:
-            rows.append([element.element_number(), element.element_type, ""])
+            if not any(j.diagnostic for j in element.joints):
+                continue
+
+            rows.append([
+                element.element_number(),
+                element.element_type,
+                ""
+            ])
         return rows
 
     def print(self):

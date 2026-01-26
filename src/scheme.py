@@ -32,20 +32,25 @@ class Scheme:
     def number_joints(self, start_joint: Joint):
         """Добавление нумерации стыков"""
         current_number = 1
-        start_joint.number = current_number
 
-        visited = set()
-        visited.add(start_joint)
+        if not start_joint.diagnostic:
+            raise ValueError("Стартовый стык не входит в диагностику")
+
+        start_joint.number = current_number
+        visited = {start_joint}
 
         def dfs(joint: Joint):
             nonlocal current_number
 
             for neighbor in self._get_neighbors(joint):
-                if neighbor not in visited:
-                    current_number += 1
-                    neighbor.number = current_number
-                    visited.add(neighbor)
-                    dfs(neighbor)
+                if neighbor in visited:
+                    continue
+                if not neighbor.diagnostic:
+                    continue
+                current_number += 1
+                neighbor.number = current_number
+                visited.add(neighbor)
+                dfs(neighbor)
 
         dfs(start_joint)
 
@@ -93,3 +98,7 @@ class Scheme:
                     raise SchemeValidationError(
                         f"Открытый сварной шов: стык {joint.temp_id}"
                     )
+
+    def apply_diagnostic_boundaries(self):
+        for element in self.elements:
+            element.apply_diagnostic_boundary()

@@ -6,10 +6,11 @@ from src.joint import Joint
 class Element(ABC):
     """Абстрактный класс для элементов"""
 
-    def __init__(self, element_type: str, joints: list[Joint], role: str):
+    def __init__(self, element_type: str, joints: list[Joint], role: str, diagnostic_end: bool = False):
         self.element_type = element_type
         self.joints = joints
         self.role = role
+        self.diagnostic_end = diagnostic_end
 
         for joint in joints:
             joint.elements.append(self)
@@ -18,6 +19,14 @@ class Element(ABC):
         """Номер элемента вида: 1-2; 3-4-5"""
         numbers = [str(j.number) for j in self.joints]
         return "-".join(numbers)
+
+    def apply_diagnostic_boundary(self):
+        if not self.diagnostic_end:
+            return
+
+        for joint in self.joints:
+            if len(joint.elements) == 1:
+                joint.diagnostic = False
 
     def __repr__(self):
         return f"{self.element_type}({self.element_number()})"
@@ -52,31 +61,31 @@ class Adapter(Element):
 class Plug(Element):
     """ Заглушка """
     def __init__(self, joint1: Joint):
-        super().__init__("Заглушка", [joint1], role="terminal")
+        super().__init__("Заглушка", [joint1], role="terminal", diagnostic_end=True)
 
 
 class Fittings(Element):
     """ ТПА """
-    def __init__(self, joint1: Joint, joint2: Joint):
-        super().__init__("ТПА", [joint1, joint2], role="pass")
+    def __init__(self, joint1: Joint, joint2: Joint, diagnostic_end=False):
+        super().__init__("ТПА", [joint1, joint2], role="pass", diagnostic_end=diagnostic_end)
 
 
 class Flange(Element):
     """ Фланец """
-    def __init__(self, joint1: Joint, joint2: Joint):
-        super().__init__("Фланец", [joint1, joint2], role="pass")
+    def __init__(self, joint1: Joint, joint2: Joint, diagnostic_end=False):
+        super().__init__("Фланец", [joint1, joint2], role="pass", diagnostic_end=diagnostic_end)
 
 
 class CandlePipe(Element):
     """ Свечная труба """
     def __init__(self, joint1: Joint):
-        super().__init__("Свечная труба", [joint1], role="terminal")
+        super().__init__("Свечная труба", [joint1], role="terminal", diagnostic_end=True)
 
 
 class PipeBreak(Element):
     """ Разрыв трубы """
     def __init__(self, joint1: Joint):
-        super().__init__("Разрыв трубы", [joint1], role="terminal")
+        super().__init__("Разрыв трубы", [joint1], role="terminal", diagnostic_end=True)
 
 
 class Branch(Element):

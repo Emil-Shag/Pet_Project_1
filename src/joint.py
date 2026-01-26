@@ -8,6 +8,7 @@ class Joint:
         Joint._counter += 1
         self.number = None
         self.elements = []
+        self.diagnostic = diagnostic
 
     def __repr__(self):
         return f"Joint({self.number})"
