@@ -1,9 +1,8 @@
 class Joint:
     """Стыки (сварные швы)"""
-
     _counter = 1
 
-    def __init__(self, diagnostic: bool = True):
+    def __init__(self, diagnostic: bool | None = None):
         self.temp_id = Joint._counter
         Joint._counter += 1
         self.number = None
