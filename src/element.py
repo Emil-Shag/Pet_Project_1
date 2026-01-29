@@ -1,5 +1,9 @@
+from __future__ import annotations
 from abc import ABC
 from src.joint import Joint
+from typing import Literal
+
+Axis = Literal["X", "Y", "Z"]
 
 
 class Element(ABC):
@@ -21,63 +25,96 @@ class Element(ABC):
 
 
 class Pipe(Element):
-    def __init__(self, joint1: Joint, joint2: Joint):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
         super().__init__("Катушка", [joint1, joint2])
+        self.axis: Axis = axis
 
 
 class Elbow(Element):
-    def __init__(self, joint1: Joint, joint2: Joint):
+    def __init__(self, joint1: Joint, joint2: Joint, axis_from: Axis = "X", axis_to: Axis = "Z"):
         super().__init__("Отвод", [joint1, joint2])
+        if axis_from == axis_to:
+            raise ValueError("Elbow axis_from и axis_to должны отличаться")
+        self.axis_from: Axis = axis_from
+        self.axis_to: Axis = axis_to
 
 
 class Adapter(Element):
-    def __init__(self, joint1: Joint, joint2: Joint):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
         super().__init__("Переход", [joint1, joint2])
+        self.axis: Axis = axis
 
 
 class Fittings(Element):
-    def __init__(self, joint1: Joint, joint2: Joint):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
         super().__init__("ТПА", [joint1, joint2])
+        self.axis: Axis = axis
+        self.tag: str | None = None
 
 
 class Flange(Element):
-    def __init__(self, joint1: Joint, joint2: Joint):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
         super().__init__("Фланец", [joint1, joint2])
+        self.axis: Axis = axis
 
 
 class Tee(Element):
-    """
-    Тройник: два стыка — магистральные (на одной прямой), третий — ветвь.
-    ВАЖНО: joint_main_1 и joint_main_2 должны быть именно магистральными.
-    """
-    def __init__(self, joint_main_1: Joint, joint_branch: Joint, joint_main_2: Joint):
+    def __init__(
+        self,
+        joint_main_1: Joint,
+        joint_branch: Joint,
+        joint_main_2: Joint,
+        axis_main: Axis = "X",
+        axis_branch: Axis = "Z",
+    ):
         super().__init__("Тройник", [joint_main_1, joint_branch, joint_main_2])
+
+        if axis_main == axis_branch:
+            raise ValueError("Tee axis_main и axis_branch должны отличаться")
+
         self.main_joints = (joint_main_1, joint_main_2)
         self.branch_joint = joint_branch
+
+        self.axis_main: Axis = axis_main
+        self.axis_branch: Axis = axis_branch
 
 
 class Insert(Element):
     """
-    Врезка в твоей логике НЕ вмешивается в магистральную нумерацию.
-    Она — отдельная ветвь, "привязанная" к элементу магистрали (host_element),
-    но НЕ подключенная к магистральным стыкам как граф.
+    Врезка = ветка, привязанная к элементу host_element.
+    Не вмешивается в магистральную нумерацию.
     """
-    def __init__(self, host_element: Element, joint_branch_1: Joint, joint_branch_2: Joint):
+    def __init__(
+        self,
+        host_element: Element,
+        joint_branch_1: Joint,
+        joint_branch_2: Joint,
+        axis_host: Axis = "X",
+        axis_branch: Axis = "Z",
+    ):
         super().__init__("Врезка", [joint_branch_1, joint_branch_2])
+
+        if axis_host == axis_branch:
+            raise ValueError("Insert axis_host и axis_branch должны отличаться")
+
         self.host_element = host_element
+        self.axis_host: Axis = axis_host
+        self.axis_branch: Axis = axis_branch
 
 
-# Концевые элементы (по желанию можешь оставить как было)
 class Plug(Element):
-    def __init__(self, joint1: Joint):
+    def __init__(self, joint1: Joint, axis: Axis = "X"):
         super().__init__("Заглушка", [joint1])
+        self.axis: Axis = axis
 
 
 class CandlePipe(Element):
-    def __init__(self, joint1: Joint):
+    def __init__(self, joint1: Joint, axis: Axis = "X"):
         super().__init__("Свечная труба", [joint1])
+        self.axis: Axis = axis
 
 
 class PipeBreak(Element):
-    def __init__(self, joint1: Joint):
+    def __init__(self, joint1: Joint, axis: Axis = "X"):
         super().__init__("Разрыв трубы", [joint1])
+        self.axis: Axis = axis

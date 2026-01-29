@@ -1,6 +1,6 @@
 # src/scheme.py
 from __future__ import annotations
-
+from collections import deque
 from src.element import Element, Tee, Insert
 from src.joint import Joint
 
@@ -25,14 +25,14 @@ class Scheme:
     # -----------------------
     # ВСПОМОГАТЕЛЬНОЕ: соседи по графу
     # -----------------------
-    @staticmethod
-    def _neighbors(joint: Joint) -> list[Joint]:
-        res: list[Joint] = []
-        for el in joint.elements:
-            for j in el.joints:
+    def _neighbors(self, joint: Joint) -> list[Joint]:
+        """Соседние стыки по элементам (обычные связи по стыкам)."""
+        out = []
+        for e in joint.elements:
+            for j in e.joints:
                 if j is not joint:
-                    res.append(j)
-        return res
+                    out.append(j)
+        return out
 
     # -----------------------
     # ПРОХОД ПО МАГИСТРАЛИ (основной ствол)
@@ -119,67 +119,133 @@ class Scheme:
     # -----------------------
     def number_joints(self, start_joint: Joint):
         """
-        ЛОГИКА:
-        1) Нумеруем магистраль целиком (по потоку)
-        2) Собираем ответвления (Tee.branch_joint и Insert ветви) в порядке от начала магистрали
-        3) Нумеруем каждую ветку целиком
+        Нумерация:
+        - идём по магистрали от start_joint
+        - у тройника: номера трёх стыков идут подряд (цельный элемент)
+        - обход ветви тройника откладываем, чтобы магистраль пронумеровалась первой
         """
-        if any(j.diagnostic is None for j in self.joints):
-            raise ValueError("Есть стыки с неуказанным diagnostic. Сначала подтвердите их.")
-
-        if start_joint.diagnostic is not True:
+        if not start_joint.diagnostic:
             raise ValueError("Стартовый стык не входит в диагностику")
 
-        # очистка старых номеров
+        # сброс старых номеров (важно, чтобы не мешали повторные нумерации)
         for j in self.joints:
             j.number = None
 
-        # 1) магистраль
-        trunk = self._collect_main_trunk(start_joint)
-        if not trunk:
-            raise ValueError("Не удалось построить магистраль от стартового стыка")
+        def is_diag(j: Joint) -> bool:
+            return getattr(j, "diagnostic", True) is True
 
-        number = 1
-        trunk[0].number = 1
-        visited: set[Joint] = {trunk[0]}
+        current = start_joint
+        num = 1
+        current.number = num
+        visited = {current}
 
-        for j in trunk[1:]:
-            number += 1
-            j.number = number
-            visited.add(j)
+        # ветви откладываем сюда (по близости к началу они попадут раньше)
+        branch_queue = deque()
 
-        # 2) собираем ветки в порядке "ближе к началу -> дальше"
-        branch_seeds: list[tuple[int, Joint]] = []
-        trunk_index = {j: idx for idx, j in enumerate(trunk)}
+        def pick_next_main_from_joint(joint: Joint) -> tuple[Joint | None, Joint | None]:
+            """
+            Если в joint сидит тройник и joint — его магистральный стык,
+            возвращаем (main_next, branch_joint). Иначе (None, None).
+            """
+            for e in joint.elements:
+                if isinstance(e, Tee):
+                    # в твоём element.py у Tee есть main_joints и branch_joint
+                    mj1, mj2 = e.main_joints
+                    bj = e.branch_joint
 
-        # 2a) ветки от тройников
-        for j in trunk:
-            for el in j.elements:
-                if isinstance(el, Tee):
-                    seed = el.branch_joint
-                    if seed.diagnostic is True and seed not in visited:
-                        branch_seeds.append((trunk_index[j], seed))
+                    if joint is mj1:
+                        return mj2, bj
+                    if joint is mj2:
+                        return mj1, bj
+            return None, None
 
-        # 2b) ветки от врезок (Insert): привязаны к host_element
-        for el in self.elements:
-            if isinstance(el, Insert):
-                host_joints = getattr(el.host_element, "joints", [])
-                host_positions = [trunk_index[j] for j in host_joints if j in trunk_index]
-                if not host_positions:
+        def pick_linear_next(prev: Joint | None, joint: Joint) -> Joint | None:
+            """
+            Выбираем "следующий" стык по магистрали, если это линейный проход:
+            - берём соседа, который не visited и не prev (если prev задан)
+            """
+            candidates = []
+            for nb in self._neighbors(joint):
+                if nb in visited:
                     continue
+                if prev is not None and nb is prev:
+                    continue
+                if not is_diag(nb):
+                    continue
+                candidates.append(nb)
+            if not candidates:
+                return None
+            # если вдруг несколько — берём первый (для MVP), потом улучшим правилом
+            return candidates[0]
 
-                pos = min(host_positions)
-                seed = el.joints[0]
-                if seed.diagnostic is True and seed not in visited:
-                    branch_seeds.append((pos, seed))
+        prev = None
 
-        branch_seeds.sort(key=lambda x: x[0])
+        # 1) сначала идём по магистрали
+        while True:
+            # обработка тройника: main_next и branch должны получить номера подряд
+            main_next, branch = pick_next_main_from_joint(current)
 
-        # 3) нумеруем ветки
-        for _, seed in branch_seeds:
-            number = self._dfs_number_component(seed, number, visited)
+            if main_next is not None and is_diag(main_next) and main_next not in visited:
+                num += 1
+                main_next.number = num
+                visited.add(main_next)
 
-        return number
+                # ветвь тройника: номер сразу следом (чтобы у тройника было подряд),
+                # но сам обход ветви откладываем
+                if branch is not None and is_diag(branch) and branch not in visited:
+                    num += 1
+                    branch.number = num
+                    visited.add(branch)
+                    branch_queue.append(branch)
+
+                prev, current = current, main_next
+                continue
+
+            # обычный линейный шаг
+            nxt = pick_linear_next(prev, current)
+            if nxt is None:
+                break
+            num += 1
+            nxt.number = num
+            visited.add(nxt)
+            prev, current = current, nxt
+
+        # 2) затем идём по ветвям (в порядке близости: как их добавили в очередь)
+        while branch_queue:
+            start_branch = branch_queue.popleft()
+
+            # локальный DFS от стартового стыка ветви
+            stack = [start_branch]
+            while stack:
+                j = stack.pop()
+                for nb in self._neighbors(j):
+                    if nb in visited:
+                        continue
+                    if not is_diag(nb):
+                        continue
+
+                    # если на ветви встречается тройник — применяем ту же логику:
+                    # main_next/branch получат номера подряд, а вторую ветвь в очередь
+                    main_next, branch = pick_next_main_from_joint(j)
+
+                    if main_next is not None and is_diag(main_next) and main_next not in visited:
+                        num += 1
+                        main_next.number = num
+                        visited.add(main_next)
+                        stack.append(main_next)
+
+                        if branch is not None and is_diag(branch) and branch not in visited:
+                            num += 1
+                            branch.number = num
+                            visited.add(branch)
+                            branch_queue.append(branch)
+                        continue
+
+                    # обычный шаг
+                    num += 1
+                    nb.number = num
+                    visited.add(nb)
+                    stack.append(nb)
 
     def get_joint_by_number(self, number: int) -> Joint | None:
         for joint in self.joints:
@@ -194,3 +260,4 @@ class Scheme:
     def internal_joints(self) -> list[Joint]:
         """Внутренние стыки: подключены минимум к двум элементам"""
         return [j for j in self.joints if len(j.elements) >= 2]
+

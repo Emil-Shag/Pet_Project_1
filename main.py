@@ -6,40 +6,58 @@ from typing import Optional
 from src.scheme import Scheme
 from src.report import ReportTable
 from src.element import (
-    Element,
+    Element, Axis,
     Pipe, Elbow, Tee, Adapter, Fittings, Flange,
     Insert, Plug, CandlePipe, PipeBreak,
 )
 
 
+# -----------------------
+# helpers (console UI)
+# -----------------------
 def print_joints(scheme: Scheme) -> None:
-    print("\nСуществующие стыки:")
-    for joint in scheme.joints:
-        if joint.diagnostic is True:
-            diag = "✓"
-        elif joint.diagnostic is False:
-            diag = "✗"
+    print("\nСтыки:")
+    for j in scheme.joints:
+        if j.diagnostic is True:
+            d = "✓"
+        elif j.diagnostic is False:
+            d = "✗"
         else:
-            diag = "?"
-
-        num = joint.number if joint.number is not None else "-"
-        print(f"  ID {joint.temp_id:<3}  diagnostic={diag}  number={num}")
+            d = "?"
+        n = j.number if j.number is not None else "-"
+        print(f"  ID {j.temp_id:<3}  diagnostic={d}  number={n}  connected={len(j.elements)}")
 
 
 def print_elements(scheme: Scheme) -> None:
-    print("\nСуществующие элементы:")
+    print("\nЭлементы:")
     if not scheme.elements:
-        print("  (пока нет элементов)")
+        print("  (пока нет)")
         return
-    for idx, elem in enumerate(scheme.elements, 1):
-        host = ""
-        if elem.element_type == "Врезка" and hasattr(elem, "host_element"):
-            host = f"  [host={elem.host_element.element_type}]"
-        print(f"  {idx:>2}: {elem.element_type:<12} joints={[j.temp_id for j in elem.joints]}{host}")
+    for idx, e in enumerate(scheme.elements, 1):
+        extra = ""
+        if e.element_type == "Врезка" and hasattr(e, "host_element"):
+            extra = f" host={getattr(e.host_element, 'element_type', '?')}"
+        print(f"  {idx:>2}: {e.element_type:<12} joints={[j.temp_id for j in e.joints]}{extra}")
 
 
 def get_joint_by_temp_id(scheme: Scheme, temp_id: int):
     return next((j for j in scheme.joints if j.temp_id == temp_id), None)
+
+
+def ask_axis(prompt: str = "Ось (X/Y/Z) [X]: ") -> Axis:
+    v = input(prompt).strip().upper()
+    return v if v in ("X", "Y", "Z") else "X"
+
+
+def ask_two_axes(prompt1: str, prompt2: str, default1: Axis = "X", default2: Axis = "Z") -> tuple[Axis, Axis]:
+    a1 = input(prompt1).strip().upper() or default1
+    a1 = a1 if a1 in ("X", "Y", "Z") else default1
+    a2 = input(prompt2).strip().upper() or default2
+    a2 = a2 if a2 in ("X", "Y", "Z") else default2
+    if a1 == a2:
+        print("⚠️ Оси совпали — заменяю вторую на Z (или X).")
+        a2 = "Z" if a1 != "Z" else "X"
+    return a1, a2
 
 
 def choose_element(scheme: Scheme, prompt: str) -> Optional[Element]:
@@ -55,21 +73,21 @@ def choose_element(scheme: Scheme, prompt: str) -> Optional[Element]:
     return None
 
 
+# -----------------------
+# new diagnostics confirmation algorithm
+# -----------------------
 def finalize_diagnostics_console(scheme: Scheme, start_joint) -> None:
     """
-    Новый алгоритм:
     1) Внутренние стыки (len(elements) >= 2) -> diagnostic=True автоматически (если None)
-    2) Крайние стыки (len(elements) <= 1) -> спрашиваем y/n (если None)
-    3) Подстраховка: предложить исключить из диагностики некоторые автоматически-True стыки
+    2) Спрашиваем только крайние стыки (len(elements) <= 1) -> y/n (если None)
+    3) Подстраховка: предложить исключить из диагностики внутренние стыки, которые True
     """
-    # 1) авто-диагностика для внутренних
-    auto_true = []
+    # 1) auto-true for internal joints
     for j in scheme.joints:
         if j.diagnostic is None and len(j.elements) >= 2:
             j.diagnostic = True
-            auto_true.append(j)
 
-    # 2) спрашиваем только крайние (в т.ч. "висячие")
+    # 2) ask only terminal joints that are still None
     pending_terminals = [j for j in scheme.joints if j.diagnostic is None and len(j.elements) <= 1]
 
     if pending_terminals:
@@ -84,47 +102,54 @@ def finalize_diagnostics_console(scheme: Scheme, start_joint) -> None:
                     j.diagnostic = True
                     break
                 if ans in ("n", "no", "н", "нет"):
-                    j.diagnostic = False
+                    # стартовый лучше не выключать
+                    if j is start_joint:
+                        print("⚠️ Стартовый стык нельзя исключить. Оставляю diagnostic=True.")
+                        j.diagnostic = True
+                    else:
+                        j.diagnostic = False
                     break
                 print("Введите y или n.")
     else:
         print("\nКрайних стыков без признака diagnostic нет.")
 
-    # 3) подстраховка — исключение внутренних авто-стыков
-    # Список кандидатов: внутренние стыки, которые сейчас True
+    # 3) backup: allow excluding some internal joints
     candidates = [j for j in scheme.joints if len(j.elements) >= 2 and j.diagnostic is True]
+    if not candidates:
+        return
 
-    if candidates:
-        print("\nПодстраховка: внутренние стыки автоматически считаются диагностируемыми.")
-        ans = input("Хотите ИСКЛЮЧИТЬ какие-то из них из диагностики? (y/n) [n]: ").strip().lower()
-        if ans in ("y", "yes", "д", "да"):
-            print("Введите ID стыков через пробел (например: 3 7 12). Пусто = не исключать.")
-            for j in candidates:
-                connected = [e.element_type for e in j.elements]
-                print(f"  ID {j.temp_id} (элементы: {connected})")
+    print("\nПодстраховка: внутренние стыки автоматически считаются диагностируемыми.")
+    ans = input("Хотите ИСКЛЮЧИТЬ какие-то из них из диагностики? (y/n) [n]: ").strip().lower()
+    if ans not in ("y", "yes", "д", "да"):
+        return
 
-            line = input("> ").strip()
-            if line:
-                try:
-                    ids = {int(x) for x in line.split()}
-                except ValueError:
-                    print("❌ Не удалось разобрать список ID. Пропускаю исключение.")
-                    ids = set()
+    print("Введите ID стыков через пробел (например: 3 7 12). Пусто = не исключать.")
+    for j in candidates:
+        connected = [e.element_type for e in j.elements]
+        print(f"  ID {j.temp_id} (элементы: {connected})")
 
-                for j in candidates:
-                    if j.temp_id in ids:
-                        # стартовый стык нельзя выключать (иначе нумерация не стартует)
-                        if j is start_joint:
-                            print(f"⚠️ ID {j.temp_id} — стартовый стык, оставляю diagnostic=True.")
-                            continue
-                        j.diagnostic = False
-                        print(f"✔ Исключён из диагностики: стык ID {j.temp_id}")
+    line = input("> ").strip()
+    if not line:
+        return
+    try:
+        ids = {int(x) for x in line.split()}
+    except ValueError:
+        print("❌ Не удалось разобрать список ID. Пропускаю.")
+        return
+
+    for j in candidates:
+        if j.temp_id in ids:
+            if j is start_joint:
+                print(f"⚠️ ID {j.temp_id} — стартовый стык, оставляю diagnostic=True.")
+                continue
+            j.diagnostic = False
+            print(f"✔ Исключён: стык ID {j.temp_id}")
 
 
 def main():
     scheme = Scheme()
 
-    # стартовый стык сразу диагностируемый
+    # стартовый стык: всегда диагностируемый
     start_joint = scheme.create_joint(diagnostic=True)
     print(f"Начальный стык создан: ID {start_joint.temp_id}")
 
@@ -132,14 +157,14 @@ def main():
         print("\nДобавить элемент:")
         print(" 1 — Катушка")
         print(" 2 — Отвод")
-        print(" 3 — Тройник (ветвление)")
+        print(" 3 — Тройник")
         print(" 4 — Переход")
         print(" 5 — ТПА")
         print(" 6 — Фланец")
-        print(" 7 — Врезка (ветка, привязана к элементу магистрали)")
-        print(" 8 — Заглушка (концевой)")
-        print(" 9 — Свечная труба (концевой)")
-        print("10 — Разрыв трубы (концевой)")
+        print(" 7 — Врезка (привязана к элементу)")
+        print(" 8 — Заглушка")
+        print(" 9 — Свечная труба")
+        print("10 — Разрыв трубы")
         print(" 0 — Завершить ввод")
 
         choice = input("> ").strip()
@@ -149,7 +174,7 @@ def main():
         element: Optional[Element] = None
 
         # -----------------------
-        # ВРЕЗКА: выбираем element-хозяин и создаём ветку (diagnostic пока None)
+        # INSERT: choose host element, then create branch joints
         # -----------------------
         if choice == "7":
             host = choose_element(scheme, "Выберите элемент-хозяин для врезки (номер из списка): ")
@@ -157,18 +182,24 @@ def main():
                 print("❌ Нет элементов или неверный выбор.")
                 continue
 
+            axis_host = getattr(host, "axis", "X")
+            axis_branch = ask_axis("Ось ветви врезки (X/Y/Z) [Z]: ")  # пользователь
+            if axis_branch == axis_host:
+                print("⚠️ Ось ветви совпала с осью хоста — меняю ветвь на Z/X.")
+                axis_branch = "Z" if axis_host != "Z" else "X"
+
             jb1 = scheme.create_joint(diagnostic=None)
             jb2 = scheme.create_joint(diagnostic=None)
 
-            element = Insert(host, jb1, jb2)
+            element = Insert(host, jb1, jb2, axis_host=axis_host, axis_branch=axis_branch)
             scheme.add_element(element)
-            print(f"✔ Добавлена Врезка (ветка) к элементу: {host.element_type}")
+            print("✔ Добавлена Врезка")
 
             print_joints(scheme)
             continue
 
         # -----------------------
-        # Для остальных элементов — выбираем базовый стык по ID
+        # for other elements: attach to a joint (by ID)
         # -----------------------
         print_joints(scheme)
         try:
@@ -182,53 +213,63 @@ def main():
             print("❌ Стык с таким ID не найден.")
             continue
 
-        # -----------------------
-        # ПРОХОДНЫЕ (2 стыка): создаём новый стык с diagnostic=None
-        # -----------------------
-        if choice in ("1", "2", "4", "5", "6"):
+        # pass-through (2 joints, 1 axis)
+        if choice in ("1", "4", "5", "6"):
+            axis = ask_axis()
             new_joint = scheme.create_joint(diagnostic=None)
 
             if choice == "1":
-                element = Pipe(base_joint, new_joint)
-            elif choice == "2":
-                element = Elbow(base_joint, new_joint)
+                element = Pipe(base_joint, new_joint, axis=axis)
             elif choice == "4":
-                element = Adapter(base_joint, new_joint)
+                element = Adapter(base_joint, new_joint, axis=axis)
             elif choice == "5":
-                element = Fittings(base_joint, new_joint)
+                element = Fittings(base_joint, new_joint, axis=axis)
             elif choice == "6":
-                element = Flange(base_joint, new_joint)
+                element = Flange(base_joint, new_joint, axis=axis)
 
             scheme.add_element(element)
             print(f"✔ Добавлен {element.element_type}")
 
-        # -----------------------
-        # ТРОЙНИК: base_joint — магистральный; создаём branch и main2 как diagnostic=None
-        # -----------------------
+        # elbow (two axes)
+        elif choice == "2":
+            axis_from, axis_to = ask_two_axes(
+                "Ось 1 (X/Y/Z) [X]: ",
+                "Ось 2 (X/Y/Z) [Z]: ",
+                default1="X",
+                default2="Z",
+            )
+            new_joint = scheme.create_joint(diagnostic=None)
+            element = Elbow(base_joint, new_joint, axis_from=axis_from, axis_to=axis_to)
+            scheme.add_element(element)
+            print("✔ Добавлен Отвод")
+
+        # tee (main + branch)
         elif choice == "3":
+            axis_main = ask_axis("Ось магистрали (X/Y/Z) [X]: ")
+            axis_branch = ask_axis("Ось ветви (X/Y/Z) [Z]: ")
+            if axis_branch == axis_main:
+                print("⚠️ Ось ветви совпала с магистралью — меняю ветвь на Z/X.")
+                axis_branch = "Z" if axis_main != "Z" else "X"
+
             branch_joint = scheme.create_joint(diagnostic=None)
             main2_joint = scheme.create_joint(diagnostic=None)
-
-            element = Tee(base_joint, branch_joint, main2_joint)
+            element = Tee(base_joint, branch_joint, main2_joint, axis_main=axis_main, axis_branch=axis_branch)
             scheme.add_element(element)
             print("✔ Добавлен Тройник")
 
-        # -----------------------
-        # КОНЦЕВЫЕ (1 стык)
-        # -----------------------
+        # terminals (1 joint, 1 axis)
         elif choice in ("8", "9", "10"):
+            axis = ask_axis()
+
             if choice == "8":
-                element = Plug(base_joint)
-                scheme.add_element(element)
-                print("✔ Добавлена Заглушка")
+                element = Plug(base_joint, axis=axis)
             elif choice == "9":
-                element = CandlePipe(base_joint)
-                scheme.add_element(element)
-                print("✔ Добавлена Свечная труба")
-            elif choice == "10":
-                element = PipeBreak(base_joint)
-                scheme.add_element(element)
-                print("✔ Добавлен Разрыв трубы")
+                element = CandlePipe(base_joint, axis=axis)
+            else:
+                element = PipeBreak(base_joint, axis=axis)
+
+            scheme.add_element(element)
+            print(f"✔ Добавлен {element.element_type}")
 
         else:
             print("❌ Неизвестная команда.")
@@ -236,14 +277,10 @@ def main():
 
         print_joints(scheme)
 
-    # -----------------------
-    # Финализация diagnostic перед нумерацией
-    # -----------------------
+    # finalize diagnostics (only terminal joints asked)
     finalize_diagnostics_console(scheme, start_joint)
 
-    # -----------------------
-    # НУМЕРАЦИЯ + ОТЧЁТ
-    # -----------------------
+    # number joints + report
     try:
         scheme.number_joints(start_joint)
     except Exception as e:
