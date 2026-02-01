@@ -1,8 +1,11 @@
 # src/scheme.py
 from __future__ import annotations
+
 from collections import deque
-from src.element import Element, Tee, Insert
+from typing import Optional
+
 from src.joint import Joint
+from src.element import Element, Tee, Insert
 
 
 class Scheme:
@@ -10,254 +13,236 @@ class Scheme:
         self.joints: list[Joint] = []
         self.elements: list[Element] = []
 
-    def create_joint(self, diagnostic: bool | None = None) -> Joint:
-        joint = Joint(diagnostic=diagnostic)
-        self.joints.append(joint)
-        return joint
+    def create_joint(self, diagnostic: Optional[bool] = None) -> Joint:
+        j = Joint(diagnostic=True if diagnostic is True else False if diagnostic is False else True)
+        # ВАЖНО: чтобы поддержать None в GUI-логике диагностики,
+        # мы храним None отдельно (как атрибут), если надо:
+        if diagnostic is None:
+            j.diagnostic = None
+        self.joints.append(j)
+        return j
 
     def add_element(self, element: Element):
         self.elements.append(element)
 
-    def get_pending_joints(self) -> list[Joint]:
-        """Стыки, для которых ещё не определили diagnostic"""
-        return [j for j in self.joints if j.diagnostic is None]
-
-    # -----------------------
-    # ВСПОМОГАТЕЛЬНОЕ: соседи по графу
-    # -----------------------
+    # =========================
+    # GRAPH HELPERS
+    # =========================
     def _neighbors(self, joint: Joint) -> list[Joint]:
-        """Соседние стыки по элементам (обычные связи по стыкам)."""
-        out = []
-        for e in joint.elements:
-            for j in e.joints:
+        """Соседние стыки по всем элементам, которые реально соединяют joint с другими стыками."""
+        out: list[Joint] = []
+        for el in joint.elements:
+            for j in el.joints:
                 if j is not joint:
                     out.append(j)
         return out
 
-    # -----------------------
-    # ПРОХОД ПО МАГИСТРАЛИ (основной ствол)
-    # -----------------------
-    def _next_main_joint(self, current: Joint, prev: Joint | None) -> Joint | None:
+    def _is_diag(self, j: Joint) -> bool:
+        return getattr(j, "diagnostic", True) is True
+
+    # =========================
+    # MERGE (for bypass cycles)
+    # =========================
+    def merge_joints(self, keep: Joint, drop: Joint) -> None:
         """
-        Возвращает следующий стык по магистрали из current, учитывая:
-        - проходные элементы (2 стыка): идём на "другой конец", не возвращаясь в prev
-        - тройник Tee: если current — магистральный стык, идём на второй магистральный
-        Ветки здесь НЕ развиваем.
+        Объединяет два стыка в один:
+        - все элементы, которые ссылались на drop, начинают ссылаться на keep
+        - keep.elements пополняется
+        - drop удаляется из scheme.joints
         """
-        attached = sorted(current.elements, key=lambda e: e.element_type)
+        if keep is drop:
+            return
 
-        for el in attached:
-            # тройник: продолжение по main_joints
-            if isinstance(el, Tee):
-                if current in el.main_joints:
-                    other_main = el.main_joints[0] if el.main_joints[1] is current else el.main_joints[1]
-                    if other_main is not prev:
-                        return other_main
+        # переназначаем ссылки у элементов
+        for el in list(drop.elements):
+            el.joints = [keep if j is drop else j for j in el.joints]
+            if el not in keep.elements:
+                keep.elements.append(el)
 
-            # проходной элемент на 2 стыка (Insert исключаем — он ветка)
-            if len(el.joints) == 2 and not isinstance(el, Insert):
-                j1, j2 = el.joints
-                nxt = j2 if j1 is current else j1
-                if nxt is not prev:
-                    return nxt
+        drop.elements.clear()
 
-        return None
+        # diagnostic merge policy
+        kd = getattr(keep, "diagnostic", None)
+        dd = getattr(drop, "diagnostic", None)
+        if kd is True or dd is True:
+            keep.diagnostic = True
+        elif kd is False and dd is False:
+            keep.diagnostic = False
+        else:
+            keep.diagnostic = kd if kd is not None else dd
 
-    def _collect_main_trunk(self, start_joint: Joint) -> list[Joint]:
-        """
-        Возвращает список стыков магистрали в порядке потока: [J1, J2, J3, ...]
-        Останавливается, когда продолжения нет.
-        """
-        trunk = [start_joint]
-        visited = {start_joint}
+        if drop in self.joints:
+            self.joints.remove(drop)
 
-        prev = None
-        cur = start_joint
-
-        while True:
-            nxt = self._next_main_joint(cur, prev)
-            if nxt is None or nxt in visited:
-                break
-            # на магистрали считаем только диагностируемые стыки
-            if nxt.diagnostic is not True:
-                break
-
-            trunk.append(nxt)
-            visited.add(nxt)
-            prev, cur = cur, nxt
-
-        return trunk
-
-    # -----------------------
-    # НУМЕРАЦИЯ ВЕТОК (DFS)
-    # -----------------------
-    def _dfs_number_component(self, start: Joint, number: int, visited: set[Joint]) -> int:
-        """
-        Нумерует связную компоненту графа, начиная со start, увеличивая number.
-        Не заходит в уже visited (туда заранее кладём магистраль).
-        """
-        stack = [start]
-        while stack:
-            j = stack.pop()
-            if j in visited or j.diagnostic is not True:
-                continue
-
-            number += 1
-            j.number = number
-            visited.add(j)
-
-            neigh = self._neighbors(j)
-            neigh_sorted = sorted(neigh, key=lambda x: x.temp_id, reverse=True)
-            for n in neigh_sorted:
-                if n not in visited and n.diagnostic is True:
-                    stack.append(n)
-
-        return number
-
-    # -----------------------
-    # ПУБЛИЧНЫЙ МЕТОД НУМЕРАЦИИ
-    # -----------------------
+    # =========================
+    # NUMBERING (mainline first, then branches, supports cycles)
+    # =========================
     def number_joints(self, start_joint: Joint):
         """
-        Нумерация:
+        Нумерация стыков:
         - идём по магистрали от start_joint
-        - у тройника: номера трёх стыков идут подряд (цельный элемент)
-        - обход ветви тройника откладываем, чтобы магистраль пронумеровалась первой
+        - у тройника: ВСЕ 3 стыка тройника получают номера подряд (цельный элемент)
+        - ветви нумеруются после магистрали (в порядке "ближе к старту")
+        - циклы допустимы: если пришли в уже пронумерованный стык — дальше по этому пути не идём
+        - нумеруем только diagnostic=True
         """
-        if not start_joint.diagnostic:
+        if not self._is_diag(start_joint):
             raise ValueError("Стартовый стык не входит в диагностику")
 
-        # сброс старых номеров (важно, чтобы не мешали повторные нумерации)
+        # reset
         for j in self.joints:
             j.number = None
 
-        def is_diag(j: Joint) -> bool:
-            return getattr(j, "diagnostic", True) is True
-
-        current = start_joint
         num = 1
-        current.number = num
-        visited = {current}
+        start_joint.number = num
+        visited: set[Joint] = {start_joint}
 
-        # ветви откладываем сюда (по близости к началу они попадут раньше)
-        branch_queue = deque()
+        branch_queue = deque()  # joints to start branches from (in order encountered)
 
-        def pick_next_main_from_joint(joint: Joint) -> tuple[Joint | None, Joint | None]:
+        def enqueue_if_new(j: Optional[Joint]):
+            if j is None:
+                return
+            if not self._is_diag(j):
+                return
+            if j in visited:
+                return
+            # IMPORTANT: assign number immediately when we enqueue from a Tee to keep Tee joints consecutive
+            nonlocal num
+            num += 1
+            j.number = num
+            visited.add(j)
+            branch_queue.append(j)
+
+        def number_if_new(j: Optional[Joint]) -> bool:
+            """Assigns next number if joint is diagnostic and not visited. Returns True if numbered."""
+            if j is None:
+                return False
+            if not self._is_diag(j):
+                return False
+            if j in visited:
+                return False
+            nonlocal num
+            num += 1
+            j.number = num
+            visited.add(j)
+            return True
+
+        def get_tee_at_joint(joint: Joint) -> Optional[Tee]:
+            for el in joint.elements:
+                if isinstance(el, Tee):
+                    return el
+            return None
+
+        def handle_branching_from_joint(joint: Joint):
             """
-            Если в joint сидит тройник и joint — его магистральный стык,
-            возвращаем (main_next, branch_joint). Иначе (None, None).
+            - Tee: number main_out, then number+enqueue branch immediately (so 3 joints consecutive for Tee)
+            - Insert: does NOT affect mainline; but its other joint becomes a branch start (enqueue/number now)
             """
-            for e in joint.elements:
-                if isinstance(e, Tee):
-                    # в твоём element.py у Tee есть main_joints и branch_joint
-                    mj1, mj2 = e.main_joints
-                    bj = e.branch_joint
+            tee = get_tee_at_joint(joint)
+            if tee is not None:
+                # determine main_out and branch
+                mj1, mj2 = tee.main_joints
+                branch = tee.branch_joint
+                if joint is mj1:
+                    main_out = mj2
+                elif joint is mj2:
+                    main_out = mj1
+                else:
+                    # joint is branch itself — then for traversal treat as normal later
+                    main_out = None
 
-                    if joint is mj1:
-                        return mj2, bj
-                    if joint is mj2:
-                        return mj1, bj
+                return main_out, branch
+
+            # Inserts: they represent a branch start but should not become "main step"
+            # If current joint has Insert attached, enqueue its other joint as a branch start.
+            for el in joint.elements:
+                if isinstance(el, Insert):
+                    # Insert has 2 joints: main & branch (in your model)
+                    j_other = el.joints[0] if el.joints[1] is joint else el.joints[1]
+                    # number+enqueue now (so insert joint gets a number, but traversal of that branch is later)
+                    enqueue_if_new(j_other)
+
             return None, None
 
-        def pick_linear_next(prev: Joint | None, joint: Joint) -> Joint | None:
+        def pick_linear_next(prev: Optional[Joint], cur: Joint) -> Optional[Joint]:
             """
-            Выбираем "следующий" стык по магистрали, если это линейный проход:
-            - берём соседа, который не visited и не prev (если prev задан)
+            Choose next joint along mainline when not forced by Tee:
+            - among neighbors, prefer not visited, diagnostic=True, and not prev
+            - if multiple (cycle), pick deterministic by temp_id
             """
-            candidates = []
-            for nb in self._neighbors(joint):
+            cands = []
+            for nb in self._neighbors(cur):
                 if nb in visited:
                     continue
                 if prev is not None and nb is prev:
                     continue
-                if not is_diag(nb):
+                if not self._is_diag(nb):
                     continue
-                candidates.append(nb)
-            if not candidates:
+                cands.append(nb)
+            if not cands:
                 return None
-            # если вдруг несколько — берём первый (для MVP), потом улучшим правилом
-            return candidates[0]
+            cands.sort(key=lambda x: x.temp_id)
+            return cands[0]
 
+        # --------------------------
+        # 1) MAINLINE traversal
+        # --------------------------
         prev = None
+        cur = start_joint
 
-        # 1) сначала идём по магистрали
         while True:
-            # обработка тройника: main_next и branch должны получить номера подряд
-            main_next, branch = pick_next_main_from_joint(current)
+            # if Tee at cur (and cur is on its mainline), force main_out, and number branch immediately
+            main_out, branch = handle_branching_from_joint(cur)
 
-            if main_next is not None and is_diag(main_next) and main_next not in visited:
-                num += 1
-                main_next.number = num
-                visited.add(main_next)
+            if main_out is not None:
+                # number main_out first
+                if number_if_new(main_out):
+                    # then number+enqueue branch (so Tee joints are consecutive)
+                    enqueue_if_new(branch)
+                    prev, cur = cur, main_out
+                    continue
+                else:
+                    # main_out already visited => cycle or already numbered
+                    # still ensure branch is queued if possible (but without renumbering)
+                    if branch is not None and self._is_diag(branch) and branch not in visited:
+                        enqueue_if_new(branch)
+                    break
 
-                # ветвь тройника: номер сразу следом (чтобы у тройника было подряд),
-                # но сам обход ветви откладываем
-                if branch is not None and is_diag(branch) and branch not in visited:
-                    num += 1
-                    branch.number = num
-                    visited.add(branch)
-                    branch_queue.append(branch)
-
-                prev, current = current, main_next
-                continue
-
-            # обычный линейный шаг
-            nxt = pick_linear_next(prev, current)
+            # normal linear step
+            nxt = pick_linear_next(prev, cur)
             if nxt is None:
                 break
-            num += 1
-            nxt.number = num
-            visited.add(nxt)
-            prev, current = current, nxt
 
-        # 2) затем идём по ветвям (в порядке близости: как их добавили в очередь)
+            number_if_new(nxt)  # always true here, but safe for cycles
+            prev, cur = cur, nxt
+
+        # --------------------------
+        # 2) BRANCHES traversal (BFS order by closeness)
+        # --------------------------
         while branch_queue:
-            start_branch = branch_queue.popleft()
+            start_b = branch_queue.popleft()
 
-            # локальный DFS от стартового стыка ветви
-            stack = [start_branch]
+            stack = [start_b]
             while stack:
                 j = stack.pop()
+
+                # branching inside branch
+                main_out, branch = handle_branching_from_joint(j)
+                if main_out is not None:
+                    if number_if_new(main_out):
+                        enqueue_if_new(branch)  # number+enqueue branch-of-branch now
+                        stack.append(main_out)
+                    else:
+                        # reached already-numbered joint => cycle closure, stop this direction
+                        if branch is not None and self._is_diag(branch) and branch not in visited:
+                            enqueue_if_new(branch)
+                    continue
+
+                # generic neighbors
                 for nb in self._neighbors(j):
+                    if not self._is_diag(nb):
+                        continue
                     if nb in visited:
-                        continue
-                    if not is_diag(nb):
-                        continue
-
-                    # если на ветви встречается тройник — применяем ту же логику:
-                    # main_next/branch получат номера подряд, а вторую ветвь в очередь
-                    main_next, branch = pick_next_main_from_joint(j)
-
-                    if main_next is not None and is_diag(main_next) and main_next not in visited:
-                        num += 1
-                        main_next.number = num
-                        visited.add(main_next)
-                        stack.append(main_next)
-
-                        if branch is not None and is_diag(branch) and branch not in visited:
-                            num += 1
-                            branch.number = num
-                            visited.add(branch)
-                            branch_queue.append(branch)
-                        continue
-
-                    # обычный шаг
-                    num += 1
-                    nb.number = num
-                    visited.add(nb)
+                        continue  # cycle closure / already numbered
+                    number_if_new(nb)
                     stack.append(nb)
-
-    def get_joint_by_number(self, number: int) -> Joint | None:
-        for joint in self.joints:
-            if joint.number == number:
-                return joint
-        return None
-
-    def terminal_joints(self) -> list[Joint]:
-        """Крайние стыки: подключены максимум к одному элементу"""
-        return [j for j in self.joints if len(j.elements) <= 1]
-
-    def internal_joints(self) -> list[Joint]:
-        """Внутренние стыки: подключены минимум к двум элементам"""
-        return [j for j in self.joints if len(j.elements) >= 2]
-

@@ -1,4 +1,4 @@
-# src/gui/main_window.py
+
 from __future__ import annotations
 
 import sys
@@ -40,6 +40,11 @@ PIPE_PEN = QPen(QColor(0, 120, 255), 3)
 PIPE_PEN.setCapStyle(Qt.RoundCap)
 PIPE_PEN.setJoinStyle(Qt.RoundJoin)
 
+SYMBOL_PEN = QPen(QColor(0, 120, 255), 2)
+SYMBOL_PEN.setCapStyle(Qt.RoundCap)
+SYMBOL_PEN.setJoinStyle(Qt.RoundJoin)
+
+THIN_BLACK = QPen(QColor(0, 0, 0), 1)
 
 # =========================
 # GRAPHICS ITEMS
@@ -65,10 +70,10 @@ class JointItem(QGraphicsEllipseItem):
         self.update_label()
 
     def update_label(self):
-        # RULES:
-        # - if joint excluded from diagnostics: do not show anything
-        # - if numbered: show number
-        # - else show temp_id only if show_temp_ids=True (pre-numbering phase)
+        # Rules:
+        # - excluded from diagnostics => hide
+        # - numbered => show number
+        # - else show temp_id only if show_temp_ids=True
         if getattr(self.joint, "diagnostic", None) is False:
             self.label.setPlainText("")
             return
@@ -89,7 +94,9 @@ class ElementItem(QGraphicsPathItem):
         self.element = element
         self.setPen(PIPE_PEN)
         self.setFlag(QGraphicsPathItem.ItemIsSelectable, True)
-
+        # separate symbol path (valves/flanges/adapters/etc.)
+        self.symbol = QGraphicsPathItem(self)
+        self.symbol.setPen(SYMBOL_PEN)
 
 # =========================
 # DIAGNOSTICS DIALOG
@@ -171,7 +178,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Конструктор трубопровода (изометрия, CAD-логика)")
-        self.resize(1450, 900)
+        self.resize(1550, 900)
 
         self.scheme = Scheme()
 
@@ -185,6 +192,8 @@ class MainWindow(QMainWindow):
 
         self.add_btn = QPushButton("Добавить")
         self.delete_btn = QPushButton("Удалить")
+        self.connect_btn = QPushButton("Соединить (байпас)")
+
         self.diagnostics_btn = QPushButton("Диагностика")
         self.number_btn = QPushButton("Нумерация + Отчёт")
 
@@ -251,6 +260,7 @@ class MainWindow(QMainWindow):
 
         left_layout.addWidget(self.add_btn)
         left_layout.addWidget(self.delete_btn)
+        left_layout.addWidget(self.connect_btn)
 
         left_layout.addSpacing(10)
 
@@ -296,6 +306,7 @@ class MainWindow(QMainWindow):
 
         # ---- stores
         self.show_temp_ids = True  # before numbering
+
         self.start_joint = self.scheme.create_joint(diagnostic=True)
 
         self.joint_items: dict[object, JointItem] = {}
@@ -305,8 +316,18 @@ class MainWindow(QMainWindow):
         # joint -> (axis, sign)
         self.joint_dir: dict[object, tuple[Axis, int]] = {}
 
+        # connect (bypass) mode state
+        self.connect_mode = False
+        self.connect_first_joint = None
+        # bypass alignment anchors
+        self.last_bypass_pair = None  # (A_joint, B_joint)
+        # UI drawing tweak: store bend for the element that was "connected" to another joint
+        # element -> QPointF bend point
+        self.element_connection_bend: dict[Element, QPointF] = {}
+        self.element_connection_keep: dict[Element, object] = {}
+
         self.ensure_joint_item(self.start_joint, QPointF(0, 0))
-        self._apply_start_dir_to_start_joint()  # from start buttons
+        self._apply_start_dir_to_start_joint()
 
         self.active_joint = self.start_joint
         self._select_only_joint(self.start_joint)
@@ -315,9 +336,38 @@ class MainWindow(QMainWindow):
         # ---- connections
         self.add_btn.clicked.connect(self.add_element)
         self.delete_btn.clicked.connect(self.delete_element)
+        self.connect_btn.clicked.connect(self.toggle_connect_mode)
+
         self.diagnostics_btn.clicked.connect(self.run_diagnostics)
         self.number_btn.clicked.connect(self.number_and_report)
         self.scene.selectionChanged.connect(self.on_selection_changed)
+
+    # -----------------------
+    # geometry helpers
+    # -----------------------
+    def step_vec(self, axis: Axis, sign: int, scale: float = 1.0) -> QPointF:
+        v = AXES_VEC[axis] * scale
+        return v if sign >= 0 else -v
+
+    def _axis_line_intersection(self, p1: QPointF, d1: QPointF, p2: QPointF, d2: QPointF) -> QPointF | None:
+        """
+        Solve p1 + t*d1 = p2 + u*d2 for t,u. Return intersection point if not parallel.
+        """
+        det = d1.x() * (-d2.y()) - d1.y() * (-d2.x())  # det([d1, -d2])
+        if abs(det) < 1e-9:
+            return None
+        rhs = p2 - p1
+        t = (rhs.x() * (-d2.y()) - rhs.y() * (-d2.x())) / det
+        return p1 + d1 * t
+
+    def _project_point_to_axis_line(self, p: QPointF, origin: QPointF, d: QPointF) -> QPointF:
+        """Project point p to line origin + t*d."""
+        v = p - origin
+        dd = d.x() * d.x() + d.y() * d.y()
+        if dd == 0:
+            return origin
+        t = (v.x() * d.x() + v.y() * d.y()) / dd
+        return origin + d * t
 
     # -----------------------
     # UI helpers
@@ -329,21 +379,17 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if sender is None:
             return
-        # mutual exclusivity
         if not sender.isChecked():
             sender.setChecked(True)
             return
         for _, _, b in self._start_buttons:
             if b is not sender:
                 b.setChecked(False)
-
-        # apply to start joint direction immediately
         self._apply_start_dir_to_start_joint()
 
     def _apply_start_dir_to_start_joint(self):
         axis, sign = self.get_start_dir()
         self.joint_dir[self.start_joint] = (axis, sign)
-        # if start is currently active, update continuation button availability
         if getattr(self, "active_joint", None) is self.start_joint:
             self._set_dir_buttons_for_joint(self.start_joint)
 
@@ -366,11 +412,9 @@ class MainWindow(QMainWindow):
 
     def _set_dir_buttons_for_joint(self, joint):
         axis0, _ = self.joint_dir.get(joint, ("X", +1))
-        # disable axis of current direction (can't choose same axis for elbow/branch continuation)
         for axis, sign, btn in self._dir_buttons:
             btn.setEnabled(axis != axis0)
 
-        # if selected now disabled -> select first enabled
         selected_axis, _ = self.get_selected_dir()
         if selected_axis == axis0:
             for axis, sign, btn in self._dir_buttons:
@@ -385,9 +429,24 @@ class MainWindow(QMainWindow):
         self.scene.clearSelection()
         self.joint_items[joint].setSelected(True)
 
-    def _select_only_element_item(self, item: ElementItem):
-        self.scene.clearSelection()
-        item.setSelected(True)
+    # -----------------------
+    # connect (bypass) mode
+    # -----------------------
+    def toggle_connect_mode(self):
+        self.connect_mode = not self.connect_mode
+        self.connect_first_joint = None
+
+        if self.connect_mode:
+            self.connect_btn.setText("Соединить (выберите 1-й стык)")
+            QMessageBox.information(
+                self, "Соединить (байпас)",
+                "Режим соединения включён.\n"
+                "Кликните по 1-му стыку, затем по 2-му стыку.\n"
+                "Стыки будут объединены в один.\n\n"
+                "Линия соединения будет нарисована с последним участком параллельно магистрали."
+            )
+        else:
+            self.connect_btn.setText("Соединить (байпас)")
 
     # -----------------------
     # selection
@@ -397,7 +456,6 @@ class MainWindow(QMainWindow):
         if not sel:
             return
 
-        # enforce single-selection behavior
         if len(sel) > 1:
             keep = sel[-1]
             self.scene.clearSelection()
@@ -405,9 +463,107 @@ class MainWindow(QMainWindow):
             sel = [keep]
 
         item = sel[0]
+
         if isinstance(item, JointItem):
-            self.active_joint = item.joint
-            self._set_dir_buttons_for_joint(self.active_joint)
+            clicked_joint = item.joint
+
+            if self.connect_mode:
+                self._handle_connect_click(clicked_joint)
+                return
+
+            # NORMAL MODE: clicking a joint moves "building cursor" there (so you can build branches)
+            self.active_joint = clicked_joint
+            self._select_only_joint(clicked_joint)
+            self._set_dir_buttons_for_joint(clicked_joint)
+            return
+
+        # ElementItem selection: no cursor move
+
+    def _handle_connect_click(self, joint):
+        if self.connect_first_joint is None:
+            self.connect_first_joint = joint
+            self.connect_btn.setText("Соединить (выберите 2-й стык)")
+            QMessageBox.information(self, "Соединить (байпас)",
+                                    f"Первый стык выбран: ID {joint.temp_id}.\nТеперь выберите второй стык.")
+            return
+
+        first = self.connect_first_joint
+        second = joint
+
+        if second is first:
+            QMessageBox.warning(self, "Соединить (байпас)", "Вы выбрали тот же стык. Выберите другой.")
+            return
+
+        keep, drop = first, second  # keep = first selected (as you requested)
+
+        # remember bypass anchors BEFORE merge
+        self.last_bypass_pair = (keep, drop)
+
+        # Find the "incoming" element that ends at drop (usually last element of a branch)
+        incoming_element = None
+        for e in list(drop.elements):
+            # Prefer element that is not also attached to keep (rare but can happen)
+            if keep not in getattr(e, "joints", []):
+                incoming_element = e
+                break
+        if incoming_element is None and drop.elements:
+            incoming_element = drop.elements[0]
+
+        # Compute an L-bend so the last segment is parallel to the "magистраль" direction at keep.
+        p_keep = self.joint_pos(keep)
+        p_drop = self.joint_pos(drop)
+
+        axis_keep, sign_keep = self.joint_dir.get(keep, ("X", +1))
+        axis_drop, sign_drop = self.joint_dir.get(drop, ("X", +1))
+
+        d_main = self.step_vec(axis_keep, sign_keep, 1.0)
+        d_branch = self.step_vec(axis_drop, sign_drop, 1.0)
+
+        # Intersection of lines: drop + t*branch and keep + u*main => perfect 2-axis polyline
+        bend = self._axis_line_intersection(p_drop, d_branch, p_keep, d_main)
+
+        # Fallback: projection to main line (still guarantees last segment parallel to main)
+        if bend is None:
+            bend = self._project_point_to_axis_line(p_drop, p_keep, d_main)
+
+        # Merge joints in model
+        try:
+            self.scheme.merge_joints(keep, drop)  # must exist in Scheme
+        except Exception as e:
+            QMessageBox.critical(self, "Соединить (байпас)", f"Ошибка при объединении стыков: {e}")
+            return
+
+        # auto bypass alignment
+        if self.last_bypass_pair:
+            self._auto_align_bypass(self.last_bypass_pair[0], keep)
+
+        # SOFT SNAP after alignment: directions строго X/Y/Z, длины любые
+        self._apply_soft_snap_chain_from(self.start_joint)
+
+        # store bend override for drawing on incoming element
+        if incoming_element is not None:
+            self.element_connection_bend[incoming_element] = bend
+            self.element_connection_keep[incoming_element] = keep
+
+        # remove drop from direction map
+        self.joint_dir.pop(drop, None)
+
+        # remove drop graphics item
+        drop_item = self.joint_items.pop(drop, None)
+        if drop_item is not None:
+            self.scene.removeItem(drop_item)
+
+        # set cursor to keep
+        self.active_joint = keep
+        self._set_dir_buttons_for_joint(keep)
+        self._select_only_joint(keep)
+
+        # exit connect mode
+        self.connect_mode = False
+        self.connect_first_joint = None
+        self.connect_btn.setText("Соединить (байпас)")
+
+        self.redraw_scene()
 
     # -----------------------
     # scene helpers
@@ -423,24 +579,136 @@ class MainWindow(QMainWindow):
     def joint_pos(self, joint) -> QPointF:
         return self.joint_items[joint].pos()
 
-    def step_vec(self, axis: Axis, sign: int, scale: float = 1.0) -> QPointF:
-        v = AXES_VEC[axis] * scale
-        return v if sign >= 0 else -v
-
     # -----------------------
     # draw paths
     # -----------------------
-    def build_path(self, element: Element) -> QPainterPath:
+    def build_paths(self, element: Element) -> tuple[QPainterPath, QPainterPath]:
         t = element.element_type
-        path = QPainterPath()
+        pipe = QPainterPath()
+        sym = QPainterPath()
+
+        # If element was used as a "connection-to-keep" after merge, draw via bend
+        bend = self.element_connection_bend.get(element)
+        keep_joint = self.element_connection_keep.get(element)
+        if bend is not None and keep_joint is not None and keep_joint in getattr(element, "joints", []):
+            js = element.joints
+            if len(js) >= 2:
+                other = js[0] if js[1] is keep_joint else js[1]
+                if other in self.joint_items and keep_joint in self.joint_items:
+                    p1 = self.joint_pos(other)
+                    p2 = self.joint_pos(keep_joint)
+                    pipe.moveTo(p1)
+                    pipe.lineTo(bend)
+                    pipe.lineTo(p2)
+
+                    return pipe, sym
 
         if t in ("Катушка", "Переход", "ТПА", "Фланец"):
             j1, j2 = element.joints
             p1 = self.joint_pos(j1)
+            if t == "Катушка":
+                axis = element.axis
+                sign = self.joint_dir.get(j2, (axis, +1))[1]
+                p2 = p1 + self.step_vec(axis, sign, element.display_len)
+                pipe.moveTo(p1)
+                pipe.lineTo(p2)
+                return pipe, sym
+
             p2 = self.joint_pos(j2)
-            path.moveTo(p1)
-            path.lineTo(p2)
-            return path
+            mid = (p1 + p2) * 0.5
+            axis = getattr(element, "axis", "X")
+            sign = self.joint_dir.get(j2, (axis, +1))[1]
+            v = self.step_vec(axis, sign, 0.22)  # along axis
+            perp = QPointF(-v.y(), v.x())  # screen-perp
+
+
+            # ===== ПЕРЕХОД (как на примере: "треугольная" вставка) =====
+
+            if t == "Переход":
+                # base pipeline
+                pipe.moveTo(p1)
+                pipe.lineTo(p2)
+                n = perp * 0.55
+                pA = mid - v * 0.95
+                pB = mid + v * 0.95
+                pC = mid + n
+                pD = mid - n * 0.25
+
+                sym.moveTo(pA)
+                sym.lineTo(pC)
+                sym.lineTo(pB)
+                sym.lineTo(pD)
+                sym.lineTo(pA)
+
+                sym.moveTo(mid - v * 0.25)
+                sym.lineTo(mid + n * 0.55)
+
+                return pipe, sym
+
+            # ===== ТПА (песочные часы) =====
+
+            if t == "ТПА":
+                # 1) ось элемента
+                d = p2 - p1
+                L = (d.x() * d.x() + d.y() * d.y()) ** 0.5
+                if L < 1e-9:
+                    return pipe, sym
+                e_main = d / L
+
+                # 2) ось "ширины" ТПА — фиксированная ISO-ось (стабильно, без "поворотов")
+                # берём ось, отличную от axis элемента
+                main_axis = getattr(element, "axis", "X")
+                if main_axis == "X":
+                    body_axis = "Y"
+                elif main_axis == "Y":
+                    body_axis = "X"
+                else:  # Z
+                    body_axis = "X"
+                e_body = self.step_vec(body_axis, +1, 1.0)
+                eb_len = (e_body.x() * e_body.x() + e_body.y() * e_body.y()) ** 0.5
+                e_body = e_body / max(eb_len, 1e-9)
+
+                # 3) размеры
+                HALF_W = UNIT * 0.35 * 1.20  # полуширина "оснований" и концов креста (в пикселях)
+
+
+                # точки на "основаниях" (пластинках)
+                p1_top = p1 + e_body * HALF_W
+                p1_bot = p1 - e_body * HALF_W
+                p2_top = p2 + e_body * HALF_W
+                p2_bot = p2 - e_body * HALF_W
+
+                # 4) основания (две пластинки у стыков)
+                sym.moveTo(p1_top);
+                sym.lineTo(p1_bot)
+                sym.moveTo(p2_top);
+                sym.lineTo(p2_bot)
+
+                # крест — диагонали ДОЛЖНЫ касаться оснований (как на твоём эталоне)
+                sym.moveTo(p1_top);
+                sym.lineTo(p2_bot)
+                sym.moveTo(p1_bot);
+                sym.lineTo(p2_top)
+
+                return pipe, sym
+
+            # ===== ФЛАНЕЦ (как на примере: две параллельные пластинки) =====
+
+            if t == "Фланец":
+                # base pipeline
+                pipe.moveTo(p1)
+                pipe.lineTo(p2)
+                pL1 = mid - v * 0.55
+                pL2 = mid + v * 0.55
+                plate = perp * 0.55
+                # two plates crossing pipe
+                sym.moveTo(pL1 - plate)
+                sym.lineTo(pL1 + plate)
+                sym.moveTo(pL2 - plate)
+                sym.lineTo(pL2 + plate)
+
+                return pipe, sym
+
 
         if t == "Отвод":
             j1, j2 = element.joints
@@ -448,11 +716,18 @@ class MainWindow(QMainWindow):
             p2 = self.joint_pos(j2)
             bend = getattr(element, "_bend_pos", None)
             if bend is None:
-                bend = (p1 + p2) * 0.5
-            path.moveTo(p1)
-            path.lineTo(bend)
-            path.lineTo(p2)
-            return path
+                # fallback: пересечение осевых линий (чтобы L был по ISO-осям)
+                axis_from, sign_from = self.joint_dir.get(j1, (element.axis_from, +1))
+                axis_to, sign_to = self.joint_dir.get(j2, (element.axis_to, +1))
+                d1 = self.step_vec(axis_from, sign_from, 1.0)
+                d2 = self.step_vec(axis_to, sign_to, 1.0)
+                bend = self._axis_line_intersection(p1, d1, p2, d2) or (p1 + p2) * 0.5
+
+            pipe.moveTo(p1)
+            pipe.lineTo(bend)
+            pipe.lineTo(p2)
+
+            return pipe, sym
 
         if t == "Тройник":
             jm1, jb, jm2 = element.joints
@@ -462,68 +737,430 @@ class MainWindow(QMainWindow):
 
             center = getattr(element, "_center_pos", None)
             if center is None:
-                path.moveTo(p_in)
-                path.lineTo(p_main2)
-                path.moveTo(p_in)
-                path.lineTo(p_branch)
-                return path
+                pipe.moveTo(p_in)
+                pipe.lineTo(p_main2)
+                pipe.moveTo(p_in)
+                pipe.lineTo(p_branch)
 
-            path.moveTo(p_in)
-            path.lineTo(center)
-            path.lineTo(p_main2)
+                return pipe, sym
 
-            path.moveTo(center)
-            path.lineTo(p_branch)
-            return path
+            pipe.moveTo(p_in)
+            pipe.lineTo(center)
+            pipe.lineTo(p_main2)
+            pipe.moveTo(center)
+            pipe.lineTo(p_branch)
+
+            return pipe, sym
 
         if t == "Врезка":
             jb1, jb2 = element.joints
             p1 = self.joint_pos(jb1)
             p2 = self.joint_pos(jb2)
-            path.moveTo(p1)
-            path.lineTo(p2)
-            return path
+            pipe.moveTo(p1)
+            pipe.lineTo(p2)
+
+            return pipe, sym
 
         if t in ("Заглушка", "Свечная труба", "Разрыв трубы"):
             j = element.joints[0]
             p = self.joint_pos(j)
             axis = getattr(element, "axis", "X")
             sign = getattr(element, "sign", +1)
-            v = self.step_vec(axis, sign, 0.25)
+            v = self.step_vec(axis, sign, 0.28)
 
             if t == "Заглушка":
-                path.moveTo(p)
-                path.lineTo(p + v)
-                cap = p + v
-                perp = QPointF(-v.y(), v.x()) * 0.2
-                path.moveTo(cap - perp)
-                path.lineTo(cap + perp)
-                return path
+                # arc-like cap + short lead (approx like your sample)
+                lead = p + v * 0.55
+                pipe.moveTo(p)
+                pipe.lineTo(lead)
+                r = 10
+                # draw a quarter-ish arc using cubic (screen space)
+                # direction depends on sign: flip arc sideways
+                side = QPointF(-v.y(), v.x())
+                side = side / max(1.0, (side.x() * side.x() + side.y() * side.y()) ** 0.5)
+                side = side * (r * (1 if sign >= 0 else -1))
+                c1 = lead + side * 0.4
+                c2 = lead + side * 1.2 + QPointF(0, r * 0.2)
+                end = lead + side * 1.4 + QPointF(0, r * 0.6)
+                sym.moveTo(lead)
+                sym.cubicTo(c1, c2, end)
+
+                return pipe, sym
 
             if t == "Свечная труба":
-                path.moveTo(p)
-                path.lineTo(p + v)
-                cap = p + v
-                perp = QPointF(-v.y(), v.x()) * 0.15
-                path.moveTo(cap - perp)
-                path.lineTo(cap + perp)
-                return path
+                # line with arrow at the end (as in sample)
+                end = p + v
+                pipe.moveTo(p)
+                pipe.lineTo(end)
+                # arrow head in screen space
+                dirv = (end - p)
+                perp = QPointF(-dirv.y(), dirv.x())
+                # normalize
+                dl = (dirv.x() * dirv.x() + dirv.y() * dirv.y()) ** 0.5 or 1.0
+                dirn = dirv / dl
+                pl = (perp.x() * perp.x() + perp.y() * perp.y()) ** 0.5 or 1.0
+                perpn = perp / pl
+                ah = 10
+                aw = 5
+                a1 = end - dirn * ah + perpn * aw
+                a2 = end - dirn * ah - perpn * aw
+                sym.moveTo(end)
+                sym.lineTo(a1)
+                sym.moveTo(end)
+                sym.lineTo(a2)
 
-            # Pipe break
+                return pipe, sym
+
             gap = v * 0.3
-            path.moveTo(p - v)
-            path.lineTo(p - gap)
-            path.moveTo(p + gap)
-            path.lineTo(p + v)
-            return path
+            # pipe break with hatch marks like sample
+            a = p - v
+            b = p - gap
+            c = p + gap
+            d = p + v
+            pipe.moveTo(a)
+            pipe.lineTo(b)
+            pipe.moveTo(c)
+            pipe.lineTo(d)
+            # hatch marks near the break end
+            hatch_dir = QPointF(-v.y(), v.x())
+            hl = 10
+            hatch_dir = hatch_dir / max(1.0, (
+            hatch_dir.x() * hatch_dir.x() + hatch_dir.y() * hatch_dir.y()) ** 0.5)
+            hatch = hatch_dir * hl
+            # 4 small hatches
+            base = d - v * 0.2
+            for k in range(4):
+                off = (-v) * (0.05 * k)
+                p0 = base + off
+                sym.moveTo(p0)
+                sym.lineTo(p0 + hatch)
 
-        return path
+            return pipe, sym
+
+        return pipe, sym
 
     def redraw_scene(self):
         for it in self.element_items:
-            it.setPath(self.build_path(it.element))
+            pipe_path, sym_path = self.build_paths(it.element)
+            it.setPath(pipe_path)
+            it.symbol.setPath(sym_path)
         for ji in self.joint_items.values():
             ji.update_label()
+
+    # =========================================================
+    # AUTO BYPASS ALIGNMENT
+    # =========================================================
+
+    def _auto_align_bypass(self, A, B):
+        path = self._find_path(A, B)
+        if not path:
+            return
+        pipes = [e for e in path if e.element_type == "Катушка"]
+        elbows = [e for e in path if e.element_type == "Отвод"]
+        if not pipes and not elbows:
+            return
+        pA = self.joint_pos(A)
+        pB = self.joint_pos(B)
+
+        p_end = self._simulate_path_position(A, path)
+        error = pB - p_end
+
+        axis_groups = {
+            ("X", +1): [],
+            ("X", -1): [],
+            ("Y", +1): [],
+            ("Y", -1): [],
+            ("Z", +1): [],
+            ("Z", -1): [],
+        }
+
+        for p in pipes:
+            j1, j2 = p.joints
+            axis, sign = self.joint_dir.get(j2, ("X", +1))
+            axis_groups[(axis, sign)].append(p)
+
+        for e in elbows:
+            j1, j2 = e.joints
+            axis1 = e.axis_from
+            axis2 = e.axis_to
+            sign1 = self.joint_dir.get(j1, (axis1, +1))[1]
+            sign2 = self.joint_dir.get(j2, (axis2, +1))[1]
+
+            axis_groups[(axis1, sign1)].append(("elbow_from", e))
+            axis_groups[(axis2, sign2)].append(("elbow_to", e))
+
+        for (axis, sign), group in axis_groups.items():
+            if not group:
+                continue
+
+            d = self.step_vec(axis, sign, 1.0)
+            mag = d.x() * d.x() + d.y() * d.y()
+
+            if mag == 0:
+                continue
+
+            proj = (error.x() * d.x() + error.y() * d.y()) / mag
+            delta_each = proj / len(group)
+
+            for typ, obj in group:
+                if typ == "pipe":
+                    obj.display_len = max(0.2, obj.display_len + delta_each)
+                elif typ == "elbow_from":
+                    obj.display_len_from = max(0.2, obj.display_len_from + delta_each)
+                elif typ == "elbow_to":
+                    obj.display_len_to = max(0.2, obj.display_len_to + delta_each)
+
+        self._rebuild_branch_geometry(A, path)
+        self.redraw_scene()
+
+    def _simulate_path_position(self, start_joint, elements):
+        pos = QPointF(self.joint_pos(start_joint))
+
+        for e in elements:
+            if e.element_type == "Катушка":
+                axis = e.axis
+                j2 = e.joints[1]
+                sign = self.joint_dir.get(j2, (axis, +1))[1]
+                pos += self.step_vec(axis, sign, e.display_len)
+            elif e.element_type == "Отвод":
+                j1, j2 = e.joints
+                sign1 = self.joint_dir.get(j1, (e.axis_from, +1))[1]
+                sign2 = self.joint_dir.get(j2, (e.axis_to, +1))[1]
+                pos += self.step_vec(e.axis_from, sign1, e.display_len_from)
+                pos += self.step_vec(e.axis_to, sign2, e.display_len_to)
+        return pos
+
+    def _rebuild_branch_geometry(self, start_joint, elements):
+        pos = QPointF(self.joint_pos(start_joint))
+
+        current = start_joint
+
+
+        for e in elements:
+
+            if e.element_type == "Катушка":
+                j2 = e.joints[1]
+                axis = e.axis
+                sign = self.joint_dir.get(j2, (axis, +1))[1]
+                pos = pos + self.step_vec(axis, sign, e.display_len)
+                self.joint_items[j2].setPos(pos)
+                current = j2
+
+            elif e.element_type == "Отвод":
+                j1, j2 = e.joints
+
+                sign1 = self.joint_dir.get(j1, (e.axis_from, +1))[1]
+                sign2 = self.joint_dir.get(j2, (e.axis_to, +1))[1]
+
+                bend = pos + self.step_vec(e.axis_from, sign1, e.display_len_from)
+                end = bend + self.step_vec(e.axis_to, sign2, e.display_len_to)
+
+                e._bend_pos = bend
+                self.joint_items[j2].setPos(end)
+
+                pos = end
+                current = j2
+
+    def _find_path(self, start, end):
+        visited = set()
+        def dfs(joint):
+            if joint == end:
+                return []
+
+            visited.add(joint)
+
+            for e in joint.elements:
+                for j in e.joints:
+                    if j in visited:
+                        continue
+                    result = dfs(j)
+                    if result is not None:
+                        return [e] + result
+            return None
+
+        return dfs(start)
+
+    def axis_vec(self, axis: str, sign: int, scale: float = 1.0) -> QPointF:
+        v = self.step_vec(axis, sign, scale)
+
+
+        return v
+
+    # -----------------------
+    # SOFT SNAP: keep ANY length, but force direction strictly to iso X/Y/Z
+    # -----------------------
+
+
+    def _iso_unit(self, axis: str, sign: int = +1) -> QPointF:
+        v = self.step_vec(axis, sign, 1.0)
+
+        ln = (v.x() * v.x() + v.y() * v.y()) ** 0.5
+
+        if ln < 1e-9:
+
+            return QPointF(1, 0)
+
+        return v / ln
+
+
+    def _closest_axis_dir(self, d: QPointF) -> tuple[str, int, QPointF]:
+        """Return (axis, sign, axis_unit_vec) that best matches vector d by angle (dot)."""
+
+        L = (d.x() * d.x() + d.y() * d.y()) ** 0.5
+
+        if L < 1e-9:
+            # fallback
+            u = self._iso_unit("X", +1)
+            return "X", +1, u
+        u = d / L
+
+        best_axis = "X"
+        best_sign = +1
+        best_dot = -1e9
+        best_u = self._iso_unit("X", +1)
+
+        for ax in ("X", "Y", "Z"):
+
+            for sg in (+1, -1):
+                au = self._iso_unit(ax, sg)
+                dot = u.x() * au.x() + u.y() * au.y()
+
+                if dot > best_dot:
+                    best_dot = dot
+                    best_axis = ax
+                    best_sign = sg
+                    best_u = au
+        return best_axis, best_sign, best_u
+
+
+    def _soft_snap_segment(self, p1: QPointF, p2: QPointF) -> tuple[QPointF, str, int]:
+        """Project p2 onto closest iso axis direction from p1 keeping original length."""
+
+        d = p2 - p1
+        L = (d.x() * d.x() + d.y() * d.y()) ** 0.5
+        axis, sign, au = self._closest_axis_dir(d)
+        p2s = p1 + au * L
+
+        return p2s, axis, sign
+
+
+
+    def _apply_soft_snap_for_element(self, start_joint, end_joint):
+        """Enforce that (start -> end) is strictly along iso X/Y/Z while keeping length.
+        Updates end joint position, and stores joint_dir for stable downstream behavior.
+        """
+
+
+        if start_joint not in self.joint_items or end_joint not in self.joint_items:
+
+            return
+        p1 = self.joint_items[start_joint].pos()
+        p2 = self.joint_items[end_joint].pos()
+        p2s, axis, sign = self._soft_snap_segment(p1, p2)
+        self.joint_items[end_joint].setPos(p2s)
+        self.joint_dir[end_joint] = (axis, sign)
+
+
+
+    def _apply_soft_snap_chain_from(self, root_joint):
+        """Soft-snap all connected segments out of root_joint (best-effort).
+        Uses current element items to traverse edges and snap endpoint positions.
+        """
+
+        # build adjacency by joints via existing elements_items
+        adj = {}
+
+        for it in self.element_items:
+            e = it.element
+            js = getattr(e, "joints", [])
+
+            if len(js) < 2:
+                continue
+            # for Tee we snap its main continuation and branch separately elsewhere
+
+            if getattr(e, "element_type", "") == "Тройник" and len(js) == 3:
+                pairs = [(js[0], js[2]), (js[0], js[1])]
+            elif getattr(e, "element_type", "") == "Врезка" and len(js) == 2:
+                pairs = [(js[0], js[1])]
+            else:
+                pairs = [(js[0], js[1])]
+            for a, b in pairs:
+                adj.setdefault(a, set()).add(b)
+                adj.setdefault(b, set()).add(a)
+
+        seen = set()
+        stack = [root_joint]
+        seen.add(root_joint)
+
+        while stack:
+            j = stack.pop()
+
+            for nb in adj.get(j, ()):
+                if nb in seen:
+                    continue
+                # snap nb relative to j
+                if j in self.joint_items and nb in self.joint_items:
+                    p1 = self.joint_items[j].pos()
+                    p2 = self.joint_items[nb].pos()
+                    p2s, axis, sign = self._soft_snap_segment(p1, p2)
+                    self.joint_items[nb].setPos(p2s)
+                    self.joint_dir[nb] = (axis, sign)
+                seen.add(nb)
+                stack.append(nb)
+
+    def plane_vec(self, main_axis: str, plane: str | None, scale: float) -> QPointF:
+        """
+        Returns a vector in the element plane, perpendicular to main axis, using isometric basis.
+        plane: "XY","XZ","YZ" or None (auto)
+        """
+
+        # choose secondary axis that forms plane with main_axis
+
+        if plane is None:
+            sec = {"X": "Y", "Y": "X", "Z": "X"}[main_axis]
+        else:
+
+            if main_axis not in plane:
+                sec = {"X": "Y", "Y": "X", "Z": "X"}[main_axis]
+            else:
+                sec = (plane.replace(main_axis, ""))  # remaining letter
+
+        return self.step_vec(sec, +1, scale)
+
+    def _basis_main_plane(self, p1: QPointF, p2: QPointF, main_axis: str, main_sign: int, plane: str | None):
+        """
+        Returns two unit vectors in screen space:
+        e_main  - along the element (p1->p2)
+        e_plane - in the chosen element plane (iso axis), made orthogonal to e_main (Gram-Schmidt)
+        """
+
+        # MAIN: strictly iso axis direction, but ANY length (soft-snap model should already align)
+        d = p2 - p1
+        L = (d.x() * d.x() + d.y() * d.y()) ** 0.5
+        if L < 1e-9:
+            return QPointF(1, 0), QPointF(0, 1), 1.0
+        e_main = self._iso_unit(main_axis, main_sign)
+        # PLANE: iso plane axis (no screen-perp)
+        vp = QPointF(self.plane_vec(main_axis, plane, 1.0))
+        vp_len = (vp.x() * vp.x() + vp.y() * vp.y()) ** 0.5
+        if vp_len < 1e-9:
+            vp = QPointF(-e_main.y(), e_main.x())
+            vp_len = 1.0
+        e_plane = vp / vp_len
+        return e_main, e_plane, L
+
+    def _poly_from_local(self, origin: QPointF, e_main: QPointF, e_plane: QPointF, L: float,
+                             pts: list[tuple[float, float]]):
+        """
+        local coords:
+        u in [0..1] along element length
+        v in [-0.5..0.5] across (relative to L, so v*L)
+        """
+
+        out = []
+        for u, v in pts:
+            out.append(origin + e_main * (u * L) + e_plane * (v * L))
+        return out
 
     # -----------------------
     # add / delete
@@ -531,158 +1168,151 @@ class MainWindow(QMainWindow):
     def add_element(self):
         selected = self.list_widget.currentItem()
         if not selected:
-            QMessageBox.warning(self, "Ошибка", "Выберите элемент слева.")
+            QMessageBox.warning(self, "Ошибка", "Выберите элемент")
             return
 
-        name = selected.text()
-        base_joint = self.active_joint
-        base_pos = self.joint_pos(base_joint)
+        elem_name = selected.text()
 
-        axis0, sign0 = self.joint_dir.get(base_joint, ("X", +1))
-        element: Element | None = None
+        # строим всегда от active_joint (он выставляется кликом по JointItem)
+        start_joint = getattr(self, "active_joint", None) or self.start_joint
+        if start_joint not in self.joint_items:
+            start_joint = self.start_joint
+        start_pos = self.joint_items[start_joint].pos()
 
-        # pass-through continues along previous direction
-        if name in ("Катушка", "Переход", "ТПА", "Фланец"):
-            end_joint = self.scheme.create_joint(diagnostic=None)
-            end_pos = base_pos + self.step_vec(axis0, sign0, 1.0)
-            self.ensure_joint_item(end_joint, end_pos)
 
-            if name == "Катушка":
-                element = Pipe(base_joint, end_joint, axis=axis0)
-            elif name == "Переход":
-                element = Adapter(base_joint, end_joint, axis=axis0)
-            elif name == "ТПА":
-                element = Fittings(base_joint, end_joint, axis=axis0)
-                tag, ok = QInputDialog.getText(self, "ТПА", "Номер ТПА (например №3.1). Можно пусто:")
-                if ok and tag.strip():
-                    element.tag = tag.strip()
-            elif name == "Фланец":
-                element = Flange(base_joint, end_joint, axis=axis0)
+        # =======================
+        # ПРОХОДНЫЕ (2 стыка)
+        # =======================
+        if elem_name in ["Катушка", "Отвод", "Переход", "ТПА", "Фланец"]:
+            end_joint = self.scheme.create_joint()
+            # первичная позиция (для отвода зададим позже точно)
+            raw_end_pos = QPointF(start_pos.x() + AXES_VEC["X"].x(), start_pos.y() + AXES_VEC["X"].y())
+            self.ensure_joint_item(end_joint, raw_end_pos)
 
-            self.joint_dir[end_joint] = (axis0, sign0)
+            if elem_name == "Катушка":
+                elem = Pipe(start_joint, end_joint)
+            elif elem_name == "Отвод":
+                # --- FIX: отвод должен быть L-образным по реальным стыкам,
+                # а не "мягко снапнутой" прямой.
+                axis_from, sign_from = self.joint_dir.get(start_joint, ("X", +1))
+                axis_to, sign_to = self.get_selected_dir()
+                # запрет совпадения осей (как в Elbow.__init__)
+                if axis_to == axis_from:
+                    axis_to = "Y" if axis_from != "Y" else "Z"
+                elem = Elbow(start_joint, end_joint, axis_from=axis_from, axis_to=axis_to)
 
-            # IMPORTANT: select only end joint, not start
+                bend = start_pos + self.step_vec(axis_from, sign_from, elem.display_len_from)
+                end_pos = bend + self.step_vec(axis_to, sign_to, elem.display_len_to)
+                elem._bend_pos = bend
+                self.joint_items[end_joint].setPos(end_pos)
+                self.joint_dir[end_joint] = (axis_to, sign_to)
+            elif elem_name == "Переход":
+                elem = Adapter(start_joint, end_joint)
+            elif elem_name == "ТПА":
+                elem = Fittings(start_joint, end_joint)
+            elif elem_name == "Фланец":
+                elem = Flange(start_joint, end_joint)
+
+            self.scheme.add_element(elem)
+            it = ElementItem(elem)
+            self.element_items.append(it)
+            self.element_item_by_element[elem] = it
+            self.scene.addItem(it)
+            # МЯГКИЙ СНАП: только для прямых проходных (катушка/переход/тпа/фланец)
+            if elem_name != "Отвод":
+                self._apply_soft_snap_for_element(start_joint, end_joint)
+
+            # курсор на новый стык
             self.active_joint = end_joint
             self._select_only_joint(end_joint)
-            self._set_dir_buttons_for_joint(self.active_joint)
+            self._set_dir_buttons_for_joint(end_joint)
+            self.redraw_scene()
+            return
 
-        elif name == "Отвод":
-            axis1, sign1 = self.get_selected_dir()
-            if axis1 == axis0:
-                QMessageBox.warning(self, "Отвод", "Продолжение отвода не может быть по той же оси. Выберите другую ось.")
-                return
+        # =======================
+        # ТРОЙНИК (3 стыка)
+        # =======================
+        if elem_name == "Тройник":
+            # Создаём два новых стыка: продолжение магистрали + ветвь
+            main2_joint = self.scheme.create_joint()
+            branch_joint = self.scheme.create_joint()
 
-            end_joint = self.scheme.create_joint(diagnostic=None)
-            bend = base_pos + self.step_vec(axis0, sign0, 0.5)
-            end_pos = bend + self.step_vec(axis1, sign1, 0.5)
-            self.ensure_joint_item(end_joint, end_pos)
+            raw_main2_pos = QPointF(start_pos.x() + AXES_VEC["X"].x(), start_pos.y() + AXES_VEC["X"].y())
+            raw_branch_pos = QPointF(start_pos.x() + AXES_VEC["Z"].x(), start_pos.y() + AXES_VEC["Z"].y())
+            self.ensure_joint_item(main2_joint, raw_main2_pos)
+            self.ensure_joint_item(branch_joint, raw_branch_pos)
 
-            element = Elbow(base_joint, end_joint, axis_from=axis0, axis_to=axis1)
-            element._bend_pos = bend
+            # ВАЖНО: Tee(start, branch, main2) как у тебя было
+            elem = Tee(start_joint, branch_joint, main2_joint)
+            self.scheme.add_element(elem)
+            it = ElementItem(elem)
+            self.element_items.append(it)
+            self.element_item_by_element[elem] = it
+            self.scene.addItem(it)
 
-            self.joint_dir[end_joint] = (axis1, sign1)
+            # МЯГКИЙ СНАП обоих плеч
+            self._apply_soft_snap_for_element(start_joint, main2_joint)
+            self._apply_soft_snap_for_element(start_joint, branch_joint)
 
-            self.active_joint = end_joint
-            self._select_only_joint(end_joint)
-            self._set_dir_buttons_for_joint(self.active_joint)
 
-        elif name == "Тройник":
-            axis_b, sign_b = self.get_selected_dir()
-            if axis_b == axis0:
-                QMessageBox.warning(self, "Тройник", "Ось ветви не может совпадать с осью магистрали.")
-                return
 
-            main2_joint = self.scheme.create_joint(diagnostic=None)
-            branch_joint = self.scheme.create_joint(diagnostic=None)
-
-            # Центр тройника (НЕ стык), ровно посередине
-            center = base_pos + self.step_vec(axis0, sign0, 0.5)
-
-            # Выход магистрали: ещё 0.5 (итого 1.0 от входного)
-            main2_pos = center + self.step_vec(axis0, sign0, 0.5)
-
-            # Ветка: 0.5 от центра
-            branch_pos = center + self.step_vec(axis_b, sign_b, 0.5)
-
-            self.ensure_joint_item(main2_joint, main2_pos)
-            self.ensure_joint_item(branch_joint, branch_pos)
-
-            element = Tee(base_joint, branch_joint, main2_joint, axis_main=axis0, axis_branch=axis_b)
-            element._center_pos = center
-
-            self.joint_dir[main2_joint] = (axis0, sign0)
-            self.joint_dir[branch_joint] = (axis_b, sign_b)
-
+            # по умолчанию продолжаем магистраль (выделяем main2)
             self.active_joint = main2_joint
             self._select_only_joint(main2_joint)
-            self._set_dir_buttons_for_joint(self.active_joint)
-
-        elif name == "Врезка":
-            host = self.choose_host_element()
-            if host is None:
-                QMessageBox.warning(self, "Врезка", "Нет элементов-хозяев.")
-                return
-
-            axis_b, sign_b = self.get_selected_dir()
-
-            attach_pos = base_pos
-            axis_host = getattr(host, "axis", "X")
-            if hasattr(host, "joints") and len(host.joints) >= 2 and host.joints[0] in self.joint_items and host.joints[1] in self.joint_items:
-                p1 = self.joint_pos(host.joints[0])
-                p2 = self.joint_pos(host.joints[1])
-                attach_pos = (p1 + p2) * 0.5
-                axis_host = getattr(host, "axis", axis_host)
-
-            if axis_b == axis_host:
-                QMessageBox.warning(self, "Врезка", "Ось ветви не должна совпадать с осью хоста.")
-                return
-
-            jb1 = self.scheme.create_joint(diagnostic=None)
-            jb2 = self.scheme.create_joint(diagnostic=None)
-
-            self.ensure_joint_item(jb1, attach_pos)
-            self.ensure_joint_item(jb2, attach_pos + self.step_vec(axis_b, sign_b, 0.9))
-
-            element = Insert(host, jb1, jb2, axis_host=axis_host, axis_branch=axis_b)
-            self.joint_dir[jb1] = (axis_b, sign_b)
-            self.joint_dir[jb2] = (axis_b, sign_b)
-
-        elif name in ("Заглушка", "Свечная труба", "Разрыв трубы"):
-            if name == "Заглушка":
-                element = Plug(base_joint, axis=axis0)
-                element.sign = sign0
-            elif name == "Свечная труба":
-                element = CandlePipe(base_joint, axis=axis0)
-                element.sign = sign0
-            else:
-                element = PipeBreak(base_joint, axis=axis0)
-                element.sign = sign0
-
-            # terminal doesn't change active joint
-            self._select_only_joint(base_joint)
-
-        else:
-            QMessageBox.warning(self, "Ошибка", f"Элемент {name} не реализован.")
+            self._set_dir_buttons_for_joint(main2_joint)
+            self.redraw_scene()
             return
 
-        # add and draw
-        self.scheme.add_element(element)
-        item = ElementItem(element)
-        self.scene.addItem(item)
-        self.element_items.append(item)
-        self.element_item_by_element[element] = item
+        # =======================
+        # ВРЕЗКА (2 стыка) / КОНЦЕВЫЕ (1 стык)
+        # =======================
+        if elem_name in ["Врезка", "Заглушка", "Свечная труба", "Разрыв трубы"]:
+            if elem_name == "Врезка":
+                end_joint = self.scheme.create_joint()
+                raw_end_pos = QPointF(start_pos.x() + AXES_VEC["Z"].x(), start_pos.y() + AXES_VEC["Z"].y())
+                self.ensure_joint_item(end_joint, raw_end_pos)
 
-        self.redraw_scene()
+                elem = Insert(start_joint, end_joint)
+                self.scheme.add_element(elem)
+                it = ElementItem(elem)
+                self.element_items.append(it)
+                self.element_item_by_element[elem] = it
+                self.scene.addItem(it)
+                self._apply_soft_snap_for_element(start_joint, end_joint)
 
-        # TPA tag label
-        if element.element_type == "ТПА" and getattr(element, "tag", None) and len(element.joints) == 2:
-            j1, j2 = element.joints
-            mid = (self.joint_pos(j1) + self.joint_pos(j2)) * 0.5
-            text = QGraphicsTextItem(element.tag)
-            text.setDefaultTextColor(QColor("black"))
-            text.setFont(QFont("Arial", 14))
-            text.setPos(mid + QPointF(10, -30))
-            self.scene.addItem(text)
+                self.active_joint = end_joint
+                self._select_only_joint(end_joint)
+                self._set_dir_buttons_for_joint(end_joint)
+                self.redraw_scene()
+                return
+
+            # концевые: рисуем короткий хвост (для визуала), но элемент подключён к одному стыку
+            # (если у тебя концевые должны вообще не создавать второй стык — оставляем так)
+            if elem_name == "Заглушка":
+                elem = Plug(start_joint)
+            elif elem_name == "Свечная труба":
+                elem = CandlePipe(start_joint)
+            elif elem_name == "Разрыв трубы":
+                elem = PipeBreak(start_joint)
+
+            self.scheme.add_element(elem)
+            it = ElementItem(elem)
+            self.element_items.append(it)
+            self.element_item_by_element[elem] = it
+            self.scene.addItem(it)
+
+            # можно нарисовать короткий “маркер” конца (необязательно)
+            # здесь просто ничего не рисуем, т.к. у тебя сами символы рисуются в build_paths()
+
+            self.active_joint = start_joint
+            self._select_only_joint(start_joint)
+            self._set_dir_buttons_for_joint(start_joint)
+            self.redraw_scene()
+            return
+
+        QMessageBox.warning(self, "Ошибка", f"Элемент {elem_name} не реализован")
+
+
 
     def delete_element(self):
         """
@@ -700,6 +1330,10 @@ class MainWindow(QMainWindow):
         if target_el is None:
             QMessageBox.information(self, "Удалить", "Нет элементов для удаления.")
             return
+
+        # remove any connection bend overlays bound to this element
+        self.element_connection_bend.pop(target_el, None)
+        self.element_connection_keep.pop(target_el, None)
 
         # remove graphics item
         gitem = self.element_item_by_element.get(target_el)
@@ -724,21 +1358,16 @@ class MainWindow(QMainWindow):
             if j is self.start_joint:
                 continue
             if len(j.elements) == 0:
-                # remove graphics
                 ji = self.joint_items.pop(j, None)
                 if ji is not None:
                     self.scene.removeItem(ji)
-                # remove from scheme
                 if j in self.scheme.joints:
                     self.scheme.joints.remove(j)
-                # remove direction
                 self.joint_dir.pop(j, None)
 
-        # active joint fallback:
-        # prefer last joint of last element if exists, else start_joint
+        # cursor fallback
         if self.scheme.elements:
             last = self.scheme.elements[-1]
-            # choose "end" joint if possible (second joint)
             lj = last.joints[-1] if last.joints else self.start_joint
             if lj in self.joint_items:
                 self.active_joint = lj
@@ -770,24 +1399,19 @@ class MainWindow(QMainWindow):
             self.redraw_scene()
 
     def number_and_report(self):
-        # complete diagnostics if needed
         if any(j.diagnostic is None for j in self.scheme.joints):
             dlg = DiagnosticsDialog(self.scheme, self.start_joint, self)
             if dlg.exec() != QDialog.Accepted:
                 return
             dlg.apply()
 
-        # numbering
         try:
-            self.scheme.number_joints(self.start_joint)
+            self.scheme.number_joints(self.start_joint)  # must be cycle-safe in Scheme
         except Exception as e:
             QMessageBox.critical(self, "Ошибка нумерации", str(e))
             return
 
-        # IMPORTANT: after numbering, stop showing temp IDs
         self.show_temp_ids = False
-
-        # redraw labels with new rule
         self.redraw_scene()
 
         report = ReportTable(self.scheme)

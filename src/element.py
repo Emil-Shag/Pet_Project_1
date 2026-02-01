@@ -25,18 +25,22 @@ class Element(ABC):
 
 
 class Pipe(Element):
-    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X", display_len: float = 1.0):
         super().__init__("Катушка", [joint1, joint2])
         self.axis: Axis = axis
+        self.display_len = display_len
 
 
 class Elbow(Element):
-    def __init__(self, joint1: Joint, joint2: Joint, axis_from: Axis = "X", axis_to: Axis = "Z"):
+    def __init__(self, joint1: Joint, joint2: Joint, axis_from: Axis = "X", axis_to: Axis = "Y",
+                 display_len_from: float = 0.5, display_len_to: float = 0.5):
         super().__init__("Отвод", [joint1, joint2])
         if axis_from == axis_to:
             raise ValueError("Elbow axis_from и axis_to должны отличаться")
         self.axis_from: Axis = axis_from
         self.axis_to: Axis = axis_to
+        self.display_len_from = display_len_from
+        self.display_len_to = display_len_to
 
 
 class Adapter(Element):
@@ -46,10 +50,11 @@ class Adapter(Element):
 
 
 class Fittings(Element):
-    def __init__(self, joint1: Joint, joint2: Joint, axis: Axis = "X"):
+    def __init__(self, joint1: Joint, joint2: Joint, axis: str = "X", plane: str | None = None):
         super().__init__("ТПА", [joint1, joint2])
-        self.axis: Axis = axis
-        self.tag: str | None = None
+        self.axis = axis
+        # plane: one of "XY","XZ","YZ" (default is any plane containing axis)
+        self.plane = plane
 
 
 class Flange(Element):
