@@ -648,25 +648,35 @@ class MainWindow(QMainWindow):
             # ===== ТПА (песочные часы) =====
 
             if t == "ТПА":
-                # 1) ось элемента
+                # 1) длина в экранных координатах
                 d = p2 - p1
                 L = (d.x() * d.x() + d.y() * d.y()) ** 0.5
                 if L < 1e-9:
                     return pipe, sym
-                e_main = d / L
 
-                # 2) ось "ширины" ТПА — фиксированная ISO-ось (стабильно, без "поворотов")
-                # берём ось, отличную от axis элемента
-                main_axis = getattr(element, "axis", "X")
-                if main_axis == "X":
-                    body_axis = "Y"
-                elif main_axis == "Y":
-                    body_axis = "X"
-                else:  # Z
-                    body_axis = "X"
-                e_body = self.step_vec(body_axis, +1, 1.0)
-                eb_len = (e_body.x() * e_body.x() + e_body.y() * e_body.y()) ** 0.5
-                e_body = e_body / max(eb_len, 1e-9)
+                # 2) главная ось ТПА: БЕРЁМ ИЗ joint_dir (там реальная ось после soft-snap)
+                # если нет — fallback на element.axis
+                axis_fallback = getattr(element, "axis", "X")
+                main_axis, main_sign = self.joint_dir.get(j2, (axis_fallback, +1))
+
+                # строго iso-вектор вдоль оси элемента
+                e_main = self._iso_unit(main_axis, main_sign)
+
+                # 3) ось "ширины" ТПА: выбираем iso-ось, максимально перпендикулярную e_main
+                # (иначе при Y/Z символ будет выглядеть как "для X")
+                plane = getattr(element, "plane", None)
+                if plane and (main_axis in plane):
+                    # если plane задан (XY/XZ/YZ) — берём вторую ось этой плоскости
+                    body_axis = plane.replace(main_axis, "")
+                else:
+                    # иначе выбираем из двух оставшихся осей ту, что ближе к перпендикуляру на экране
+                    candidates = [ax for ax in ("X", "Y", "Z") if ax != main_axis]
+
+                    def abs_dot(ax: str) -> float:
+                        u = self._iso_unit(ax, +1)
+                        return abs(u.x() * e_main.x() + u.y() * e_main.y())
+                    body_axis = min(candidates, key=abs_dot)
+                e_body = self._iso_unit(body_axis, +1)
 
                 # 3) размеры
                 HALF_W = UNIT * 0.35 * 1.20  # полуширина "оснований" и концов креста (в пикселях)
@@ -684,7 +694,7 @@ class MainWindow(QMainWindow):
                 sym.moveTo(p2_top);
                 sym.lineTo(p2_bot)
 
-                # крест — диагонали ДОЛЖНЫ касаться оснований (как на твоём эталоне)
+                # 5) крест — диагонали касаются оснований
                 sym.moveTo(p1_top);
                 sym.lineTo(p2_bot)
                 sym.moveTo(p1_bot);
@@ -1185,12 +1195,20 @@ class MainWindow(QMainWindow):
         # =======================
         if elem_name in ["Катушка", "Отвод", "Переход", "ТПА", "Фланец"]:
             end_joint = self.scheme.create_joint()
-            # первичная позиция (для отвода зададим позже точно)
-            raw_end_pos = QPointF(start_pos.x() + AXES_VEC["X"].x(), start_pos.y() + AXES_VEC["X"].y())
+            # первичная позиция: вдоль текущего направления активного стыка,
+            # иначе все проходные элементы всегда "смотрят" по X.
+            axis0, sign0 = self.joint_dir.get(start_joint, ("X", +1))
+            step0 = self.step_vec(axis0, sign0, 1.0)  # 1 UNIT по нужной оси
+            raw_end_pos = QPointF(start_pos.x() + step0.x(), start_pos.y() + step0.y())
             self.ensure_joint_item(end_joint, raw_end_pos)
 
             if elem_name == "Катушка":
                 elem = Pipe(start_joint, end_joint)
+                # важно: чтобы отрисовка катушки брала правильную ось
+                if hasattr(elem, "axis"):
+                    elem.axis = axis0
+                if hasattr(elem, "sign"):
+                    elem.sign = sign0
             elif elem_name == "Отвод":
                 # --- FIX: отвод должен быть L-образным по реальным стыкам,
                 # а не "мягко снапнутой" прямой.
@@ -1208,10 +1226,22 @@ class MainWindow(QMainWindow):
                 self.joint_dir[end_joint] = (axis_to, sign_to)
             elif elem_name == "Переход":
                 elem = Adapter(start_joint, end_joint)
+                if hasattr(elem, "axis"):
+                    elem.axis = axis0
+                if hasattr(elem, "sign"):
+                    elem.sign = sign0
             elif elem_name == "ТПА":
                 elem = Fittings(start_joint, end_joint)
+                if hasattr(elem, "axis"):
+                    elem.axis = axis0
+                if hasattr(elem, "sign"):
+                    elem.sign = sign0
             elif elem_name == "Фланец":
                 elem = Flange(start_joint, end_joint)
+                if hasattr(elem, "axis"):
+                    elem.axis = axis0
+                if hasattr(elem, "sign"):
+                    elem.sign = sign0
 
             self.scheme.add_element(elem)
             it = ElementItem(elem)
